@@ -247,4 +247,4 @@ This script uses the Claude API to analyze document content. The text extracted 
 
 ## License
 
-Free to use and modify for personal and commercial use.
+None
