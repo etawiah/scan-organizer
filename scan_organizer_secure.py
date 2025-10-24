@@ -443,6 +443,28 @@ class ScanFolderHandler(FileSystemEventHandler):
             self.processing_files.discard(file_path)
 
 
+def load_last_folder():
+    """Load the last used scan folder from config file"""
+    config_file = Path.home() / '.scan_organizer_config.json'
+    if config_file.exists():
+        try:
+            with open(config_file, 'r') as f:
+                config = json.load(f)
+                return config.get('last_scan_folder')
+        except:
+            return None
+    return None
+
+def save_last_folder(folder_path):
+    """Save the scan folder path for next time"""
+    config_file = Path.home() / '.scan_organizer_config.json'
+    try:
+        config = {'last_scan_folder': str(folder_path)}
+        with open(config_file, 'w') as f:
+            json.dump(config, f)
+    except Exception as e:
+        print(f"Note: Could not save folder preference: {e}")
+
 def main():
     """Main entry point"""
     print("\n" + "="*60)
@@ -453,11 +475,26 @@ def main():
     if len(sys.argv) > 1:
         scan_folder = sys.argv[1]
     else:
-        scan_folder = input("\nEnter the path to your scan folder: ").strip()
+        # Check for previously saved folder
+        last_folder = load_last_folder()
+        
+        if last_folder:
+            print(f"\nLast used folder: {last_folder}")
+            use_last = input("Use this folder? (Y/n): ").strip().lower()
+            
+            if use_last == '' or use_last == 'y':
+                scan_folder = last_folder
+            else:
+                scan_folder = input("\nEnter the path to your scan folder: ").strip()
+        else:
+            scan_folder = input("\nEnter the path to your scan folder: ").strip()
     
     if not scan_folder:
         print("Error: No scan folder provided")
         sys.exit(1)
+    
+    # Save this folder for next time
+    save_last_folder(scan_folder)
     
     # Ask about AI classification
     print("\nClassification method:")
