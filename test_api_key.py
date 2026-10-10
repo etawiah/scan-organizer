@@ -12,7 +12,7 @@ if not api_key:
     print("ERROR: ANTHROPIC_API_KEY environment variable not set")
     exit(1)
 
-print(f"Found API key: {api_key[:10]}...{api_key[-4:]}")
+print("Found API key: present (value hidden)")
 print("\nTesting API connection...")
 
 try:
