@@ -1,50 +1,60 @@
 #!/usr/bin/env python3
-"""Test if your Anthropic API key works"""
+"""Smoke test for your Anthropic API key.
 
-import os
+Does NOT print the key or any fragment of it. Only reports whether the key
+is present in the environment and whether a trivial /v1/messages call works.
+"""
+
 import json
+import os
+import sys
+import urllib.error
 import urllib.request
 
-# Get API key from environment
-api_key = os.environ.get('ANTHROPIC_API_KEY')
 
-if not api_key:
-    print("ERROR: ANTHROPIC_API_KEY environment variable not set")
-    exit(1)
+def main() -> int:
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("ERROR: ANTHROPIC_API_KEY environment variable not set")
+        return 1
 
-print(f"Found API key: {api_key[:10]}...{api_key[-4:]}")
-print("\nTesting API connection...")
+    print("Found API key: present (value hidden)")
+    print("\nTesting API connection...")
 
-try:
     request_body = {
-        "model": "claude-sonnet-4-20250514",
+        "model": os.environ.get("SCAN_MODEL", "claude-sonnet-4-20250514"),
         "max_tokens": 100,
-        "messages": [
-            {"role": "user", "content": "Say hello in one word"}
-        ]
+        "messages": [{"role": "user", "content": "Say hello in one word"}],
     }
-    
+
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
-        data=json.dumps(request_body).encode('utf-8'),
+        data=json.dumps(request_body).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
             "x-api-key": api_key,
-            "anthropic-version": "2023-06-01"
+            "anthropic-version": "2023-06-01",
         },
-        method="POST"
+        method="POST",
     )
-    
-    with urllib.request.urlopen(req, timeout=30) as response:
-        result = json.loads(response.read().decode('utf-8'))
-        print("\n✓ SUCCESS! API key is working!")
-        print(f"Claude's response: {result['content'][0]['text']}")
-        
-except urllib.error.HTTPError as e:
-    print(f"\n✗ FAILED: HTTP Error {e.code}")
-    print(f"Reason: {e.reason}")
-    error_body = e.read().decode('utf-8')
-    print(f"Details: {error_body}")
-    
-except Exception as e:
-    print(f"\n✗ FAILED: {e}")
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            print("\n[OK] API key is working!")
+            print(f"Claude's response: {result['content'][0]['text']}")
+            return 0
+    except urllib.error.HTTPError as exc:
+        print(f"\n[FAIL] HTTP Error {exc.code}: {exc.reason}")
+        try:
+            print(f"Details: {exc.read().decode('utf-8')}")
+        except Exception:
+            pass
+        return 2
+    except Exception as exc:
+        print(f"\n[FAIL] {exc}")
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
