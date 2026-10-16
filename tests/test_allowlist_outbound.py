@@ -291,7 +291,7 @@ def test_print_prompts_dumps_allowlist_prompt(
 
     prompts_path = tmp_scan_tree["log"] / "prompts-allowlist.jsonl"
     cfg = runconfig_factory(provider="gemini", dry_run=True)
-    cfg.print_prompts = True
+    cfg.prompts_only = True
     cfg.prompts_path = prompts_path
     process_batch(cfg)
     assert prompts_path.exists()
