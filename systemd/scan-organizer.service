@@ -1,0 +1,34 @@
+# Weekly scan-organizer batch, invoked by scan-organizer.timer.
+#
+# Install:
+#   sudo cp systemd/scan-organizer.service /etc/systemd/system/
+#   sudo cp systemd/scan-organizer.timer   /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now scan-organizer.timer
+#
+# Config:
+#   /etc/default/scan-organizer must set at least:
+#     SCANS_HOST_PATH=/mnt/nas/scans
+#     CONFIG_HOST_PATH=/opt/scan-organizer/config
+#     SCAN_PROVIDER=anthropic|gemini|local-keyword
+#     ANTHROPIC_API_KEY=... (if using anthropic)
+#     GEMINI_API_KEY=...    (if using gemini)
+#
+# Verify the NFS mount is up BEFORE launching the container.
+
+[Unit]
+Description=scan-organizer weekly batch
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+ConditionPathIsMountPoint=/mnt/nas/scans
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/default/scan-organizer
+WorkingDirectory=/opt/scan-organizer
+ExecStartPre=/bin/sh -c 'mountpoint -q "${SCANS_HOST_PATH:-/mnt/nas/scans}"'
+ExecStart=/usr/bin/docker compose run --rm scan-organizer
+TimeoutStartSec=6h
+StandardOutput=journal
+StandardError=journal

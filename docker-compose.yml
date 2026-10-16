@@ -1,0 +1,49 @@
+# scan-organizer compose file.
+#
+# Designed to run on a Debian Docker host that mounts the Synology scans share
+# over NFS at ${SCANS_HOST_PATH:-/mnt/nas/scans}. The container itself does NOT
+# run on the NAS. For a hands-off weekly batch, use `docker compose run --rm`
+# from cron or a systemd timer — see cron.example and systemd/ for ready-made
+# snippets.
+#
+# Environment:
+#   SCANS_HOST_PATH         Host path where the NFS share is mounted
+#   CONFIG_HOST_PATH        Host path holding taxonomy.yaml + private_terms.txt
+#   SCAN_PROVIDER           anthropic | gemini | local-keyword
+#   SCAN_MODEL              Optional model id override
+#   ANTHROPIC_API_KEY       Required when SCAN_PROVIDER=anthropic
+#   GEMINI_API_KEY          Required when SCAN_PROVIDER=gemini
+#
+# Minimal weekly run (dry-run):
+#   docker compose run --rm scan-organizer --dry-run
+#
+# Real weekly run:
+#   docker compose run --rm scan-organizer
+
+services:
+  scan-organizer:
+    image: scan-organizer:latest
+    build:
+      context: .
+    environment:
+      SCANS_ROOT: /scans
+      SCAN_PROVIDER: ${SCAN_PROVIDER:-local-keyword}
+      SCAN_MODEL: ${SCAN_MODEL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - type: bind
+        source: ${SCANS_HOST_PATH:?set SCANS_HOST_PATH to the NFS mountpoint, e.g. /mnt/nas/scans}
+        target: /scans
+      - type: bind
+        source: ${CONFIG_HOST_PATH:-./config}
+        target: /config
+        read_only: true
+    # Overlay the user's config files on top of the baked-in defaults.
+    command: >-
+      --non-interactive
+      --taxonomy /config/taxonomy.yaml
+      --private-terms /config/private_terms.txt
+    # The weekly batch is launched via `docker compose run --rm`, so no
+    # restart policy is defined. Keep the service short-lived.

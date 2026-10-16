@@ -1,0 +1,13 @@
+[Unit]
+Description=Weekly timer for scan-organizer
+
+[Timer]
+# Sunday 03:17 local time, with Persistent=true so a missed run (host was off)
+# fires on the next boot.
+OnCalendar=Sun 03:17
+Persistent=true
+RandomizedDelaySec=15m
+Unit=scan-organizer.service
+
+[Install]
+WantedBy=timers.target
