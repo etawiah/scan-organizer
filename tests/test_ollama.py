@@ -216,9 +216,9 @@ def test_remote_ollama_url_never_opens_a_socket(monkeypatch, taxonomy):
     settings = ClassifierSettings(provider="ollama")
     result = classify(CLEAN_BILL, "bill.pdf", taxonomy, settings)
     assert calls["n"] == 0
-    assert result["provider"] == "local-keyword"
-    assert result.get("fallback_from") == "ollama"
-    assert result.get("fallback_reason") == "OllamaURLError"
+    assert result["provider"] == "ollama"
+    assert result.get("ollama_error") is True
+    assert result.get("ollama_error_reason") == "OllamaURLError"
 
 
 def test_ollama_sends_full_redacted_ocr_and_skips_allowlist(
@@ -304,13 +304,23 @@ def test_ollama_ignores_cloud_call_budget(monkeypatch, taxonomy):
     assert budget.used == 0
 
 
-def test_ollama_private_term_still_stays_local(monkeypatch, taxonomy):
+def test_ollama_private_term_filename_still_reaches_ollama(monkeypatch, taxonomy):
     monkeypatch.setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+    called = {"n": 0}
 
-    def boom(*_a, **_k):
-        raise AssertionError("ollama must not be called for a private-term filename")
+    def fake_call(prompt, settings):
+        called["n"] += 1
+        assert "City Electric Co" in prompt
+        return json.dumps({
+            "owner": "Household",
+            "area": "Home",
+            "doc_type": "Utilities",
+            "confidence": 0.91,
+            "short_name": "electric_bill",
+            "doc_date": "",
+        })
 
-    monkeypatch.setattr(classifier_mod, "_call_ollama", boom)
+    monkeypatch.setattr(classifier_mod, "_call_ollama", fake_call)
     terms = SensitiveTerms.load(
         path=None, extra_terms=["Zebulon Quill"], include_builtins=False,
     )
@@ -322,34 +332,44 @@ def test_ollama_private_term_still_stays_local(monkeypatch, taxonomy):
         settings,
         terms=terms,
         file_path="/scans/Zebulon/bill.pdf",
+        local_ocr_text=CLEAN_BILL,
     )
-    assert result["provider"] == "local-keyword"
-    assert result.get("privacy_blocked") is True
+    assert called["n"] == 1
+    assert result["provider"] == "ollama"
+    assert not result.get("privacy_blocked")
 
 
-def test_ollama_local_only_category_still_short_circuits(
+def test_ollama_local_only_category_reaches_ollama(
     tmp_scan_tree, runconfig_factory, monkeypatch,
 ):
     monkeypatch.setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+    called = {"n": 0}
+    bank = "checking account monthly statement deposit withdrawal"
 
-    def boom(*_a, **_k):
-        raise AssertionError("ollama must not be called for Finance-Bank")
+    def fake_call(prompt, settings):
+        called["n"] += 1
+        assert "checking account" in prompt
+        return json.dumps({
+            "owner": "Personal",
+            "area": "",
+            "doc_type": "Finance-Bank",
+            "confidence": 0.91,
+            "short_name": "bank_statement",
+            "doc_date": "",
+        })
 
-    monkeypatch.setattr(classifier_mod, "_call_ollama", boom)
-    _write(
-        tmp_scan_tree["src"] / "bank.pdf",
-        "checking account monthly statement deposit withdrawal",
-    )
+    monkeypatch.setattr(classifier_mod, "_call_ollama", fake_call)
+    _write(tmp_scan_tree["src"] / "bank.pdf", bank)
 
     def fake_extract(path: Path, max_pages: int = 5, dpi: int = 300) -> str:
-        return "checking account monthly statement deposit withdrawal"
+        return bank
 
     monkeypatch.setattr(ocr_mod, "extract_text", fake_extract)
     cfg = runconfig_factory(provider="ollama")
     result = process_batch(cfg)
-    assert result.outcomes
-    assert result.outcomes[0].provider == "local-keyword"
-    assert result.outcomes[0].classification.get("privacy_blocked") is True
+    assert called["n"] == 1
+    assert result.outcomes[0].provider == "ollama"
+    assert not result.outcomes[0].classification.get("privacy_blocked")
 
 
 def test_ollama_ocr_capped_at_about_2500_tokens(monkeypatch, taxonomy):
@@ -448,29 +468,5 @@ def test_low_confidence_ollama_answer_goes_to_review(
     assert "should_not_file" not in (outcome.dest.name if outcome.dest else "")
 
 
-def test_private_term_kids_hit_never_calls_ollama(
-    tmp_scan_tree, runconfig_factory, monkeypatch,
-):
-    monkeypatch.setenv("OLLAMA_URL", "http://192.168.3.10:11434")
-    kids = (
-        "Placeholder Elementary Report Card — grade 4 — immunization record. "
-        "Student Zebulon Quill."
-    )
-    _write(tmp_scan_tree["src"] / "zebulon_report_card.pdf", kids)
-
-    def fake_extract(path: Path, max_pages: int = 5, dpi: int = 300) -> str:
-        return kids
-
-    def boom(*_a, **_k):
-        raise AssertionError("ollama must not be called for a private-term/kids hit")
-
-    monkeypatch.setattr(ocr_mod, "extract_text", fake_extract)
-    monkeypatch.setattr(classifier_mod, "_call_ollama", boom)
-    monkeypatch.setattr(classifier_mod, "classify", boom)
-    cfg = runconfig_factory(provider="ollama", extra_terms=["Zebulon Quill"])
-    result = process_batch(cfg)
-    assert result.outcomes
-    outcome = result.outcomes[0]
-    assert outcome.provider == "local-keyword"
-    assert outcome.classification.get("privacy_blocked") is True
-    assert outcome.classification.get("privacy") == "local-only: sensitive"
+# Private-term / kids / no-cloud-fallback policy lives in
+# tests/test_ollama_local_policy.py.
