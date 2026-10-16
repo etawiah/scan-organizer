@@ -84,11 +84,27 @@ def _classify_file(
     ``text`` is OCR output. We *always* run it through
     :func:`scanorganizer.privacy.gate` first, which both scrubs the
     outbound copy and decides whether the document is safe to leave the
-    host at all. Sensitive documents fall through to the local keyword
+    host at all. The original filename and path are checked the same way:
+    a private-term hit on either marks the file ``local-only: sensitive``.
+    Labels that are not blocked still go through the same redaction before
+    they are interpolated into a provider prompt, and are dropped if they
+    are not clean. Sensitive documents fall through to the local keyword
     classifier and the manifest records a ``local-only: sensitive`` entry
     together with category counts (never the matched strings themselves).
     """
     report: RedactionReport = gate(text, sensitive_terms)
+    # Filenames and parent path segments are not OCR'd, so they must be
+    # checked the same way as document text. A private-term hit here is
+    # treated as sensitive content: local-only, never a cloud provider.
+    name_hits = sensitive_terms.count_hits(file_path.name)
+    path_hits = sensitive_terms.count_hits(str(file_path))
+    label_hits = max(name_hits, path_hits)
+    if label_hits:
+        report.sensitive = True
+        report.sensitive_reason = "private-term-match"
+        report.category_counts["private_term"] = (
+            report.category_counts.get("private_term", 0) + label_hits
+        )
     if report.sensitive:
         from . import local_rules
         result = local_rules.classify(text, taxonomy, file_path.name)
@@ -98,7 +114,14 @@ def _classify_file(
         result["privacy_report"] = report.summary_for_manifest()
         return result
     scrubbed = report.scrubbed_text or ""
-    out = classifier_mod.classify(scrubbed, file_path.name, taxonomy, settings)
+    out = classifier_mod.classify(
+        scrubbed,
+        file_path.name,
+        taxonomy,
+        settings,
+        terms=sensitive_terms,
+        file_path=str(file_path),
+    )
     out["privacy_report"] = report.summary_for_manifest()
     return out
 

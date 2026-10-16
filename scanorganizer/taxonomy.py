@@ -33,6 +33,28 @@ class TaxonomyError(ValueError):
     """Raised when a taxonomy file is malformed."""
 
 
+# Historical classifier output used "Tax"; the canonical category is "Taxes".
+DEFAULT_DOC_TYPE_ALIASES: Dict[str, str] = {
+    "Tax": "Taxes",
+}
+
+
+def alias_doc_type(
+    doc_type: str,
+    aliases: Optional[Mapping[str, str]] = None,
+) -> str:
+    """Map a legacy doc_type (e.g. ``Tax``) onto its canonical name."""
+    if not doc_type:
+        return doc_type
+    table = dict(DEFAULT_DOC_TYPE_ALIASES)
+    if aliases:
+        table.update(dict(aliases))
+    if doc_type in table:
+        return table[doc_type]
+    lowered = {k.lower(): v for k, v in table.items()}
+    return lowered.get(doc_type.lower(), doc_type)
+
+
 @dataclass(frozen=True)
 class TaxonomyNode:
     owner: str
@@ -55,6 +77,7 @@ class Taxonomy:
     confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD
     review_folder: str = DEFAULT_REVIEW_NAME
     unsorted_folder: str = DEFAULT_UNSORTED_NAME
+    doc_type_aliases: Dict[str, str] = field(default_factory=lambda: dict(DEFAULT_DOC_TYPE_ALIASES))
 
     @classmethod
     def load(cls, path: Path | str) -> "Taxonomy":
@@ -69,6 +92,13 @@ class Taxonomy:
 
     @classmethod
     def from_mapping(cls, data: Mapping) -> "Taxonomy":
+        aliases = dict(DEFAULT_DOC_TYPE_ALIASES)
+        raw_aliases = data.get("doc_type_aliases") or data.get("aliases") or {}
+        if isinstance(raw_aliases, Mapping):
+            for src, dst in raw_aliases.items():
+                if isinstance(src, str) and isinstance(dst, str) and src and dst:
+                    aliases[src] = dst
+
         tree_raw = data.get("tree")
         if not isinstance(tree_raw, Mapping) or not tree_raw:
             raise TaxonomyError("Taxonomy must have a non-empty top-level 'tree:' mapping.")
@@ -92,7 +122,9 @@ class Taxonomy:
                         raise TaxonomyError(
                             f"Invalid doc_type {dt!r} under {owner}/{area_key!r}"
                         )
-                    clean_types.append(dt)
+                    canonical = alias_doc_type(dt, aliases)
+                    if canonical not in clean_types:
+                        clean_types.append(canonical)
                 tree[owner][area_key] = clean_types
 
         threshold = data.get("confidence_threshold", DEFAULT_CONFIDENCE_THRESHOLD)
@@ -108,10 +140,15 @@ class Taxonomy:
             confidence_threshold=threshold,
             review_folder=str(data.get("review_folder", DEFAULT_REVIEW_NAME)),
             unsorted_folder=str(data.get("unsorted_folder", DEFAULT_UNSORTED_NAME)),
+            doc_type_aliases=aliases,
         )
+
+    def canonicalize_doc_type(self, doc_type: str) -> str:
+        return alias_doc_type(doc_type, self.doc_type_aliases)
 
     def is_valid_node(self, owner: str, area: Optional[str], doc_type: str) -> bool:
         area_key = "" if area is None else str(area)
+        doc_type = self.canonicalize_doc_type(doc_type)
         return (
             owner in self.tree
             and area_key in self.tree[owner]
@@ -120,6 +157,7 @@ class Taxonomy:
 
     def node(self, owner: str, area: Optional[str], doc_type: str) -> TaxonomyNode:
         area_key = "" if area is None else str(area)
+        doc_type = self.canonicalize_doc_type(doc_type)
         if not self.is_valid_node(owner, area_key, doc_type):
             raise TaxonomyError(f"Not a valid taxonomy node: {owner}/{area_key}/{doc_type}")
         return TaxonomyNode(owner=owner, area=area_key, doc_type=doc_type)

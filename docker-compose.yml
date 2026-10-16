@@ -13,6 +13,7 @@
 #   SCAN_MODEL              Optional model id override
 #   ANTHROPIC_API_KEY       Required when SCAN_PROVIDER=anthropic
 #   GEMINI_API_KEY          Required when SCAN_PROVIDER=gemini
+#   SCAN_UID_GID            Container user:group (default 1033:100)
 #
 # Minimal weekly run (dry-run):
 #   docker compose run --rm scan-organizer --dry-run
@@ -25,6 +26,9 @@ services:
     image: scan-organizer:latest
     build:
       context: .
+    # Run as the share owner so NFS writes land with the right uid/gid.
+    # Override with SCAN_UID_GID (e.g. SCAN_UID_GID=1000:100).
+    user: ${SCAN_UID_GID:-1033:100}
     environment:
       SCANS_ROOT: /scans
       SCAN_PROVIDER: ${SCAN_PROVIDER:-local-keyword}

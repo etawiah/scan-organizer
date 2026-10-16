@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from scanorganizer import local_rules
-from scanorganizer.classifier import ClassifierSettings, classify
+from scanorganizer.classifier import ClassifierSettings, _coerce, classify
 from scanorganizer.taxonomy import Taxonomy
 
 
@@ -72,6 +72,17 @@ def test_classifier_dispatch_local_keyword(taxonomy):
     assert result["owner"] == "Personal"
     assert result["doc_type"] == "Taxes"
     assert result["provider"] == "local-keyword"
+
+
+def test_coerce_maps_tax_alias_to_taxes():
+    out = _coerce({
+        "owner": "Business",
+        "area": "ComplexTech",
+        "doc_type": "Tax",
+        "confidence": 0.9,
+        "short_name": "corp_return",
+    })
+    assert out["doc_type"] == "Taxes"
 
 
 def test_classifier_falls_back_when_remote_missing(taxonomy, monkeypatch):

@@ -46,3 +46,28 @@ def test_threshold_bounds():
 def test_tree_required():
     with pytest.raises(TaxonomyError):
         Taxonomy.from_mapping({})
+
+
+def test_tax_alias_maps_to_taxes(taxonomy):
+    assert "Tax" not in taxonomy.tree["Business"]["ComplexTech"]
+    assert "Taxes" in taxonomy.tree["Business"]["ComplexTech"]
+    assert "Tax" not in taxonomy.tree["Business"]["ElJetSit"]
+    assert "Taxes" in taxonomy.tree["Business"]["ElJetSit"]
+
+    personal = taxonomy.node("Personal", "", "Tax")
+    assert personal.doc_type == "Taxes"
+    assert personal.as_relpath().as_posix() == "Personal/Taxes"
+
+    business = taxonomy.node("Business", "ComplexTech", "Tax")
+    assert business.doc_type == "Taxes"
+    assert business.as_relpath().as_posix() == "Business/ComplexTech/Taxes"
+    assert taxonomy.is_valid_node("Business", "ElJetSit", "Tax")
+
+
+def test_tax_in_mapping_is_merged_to_taxes():
+    tax = Taxonomy.from_mapping({
+        "tree": {"Business": {"X": ["Tax", "Taxes"]}},
+        "confidence_threshold": 0.5,
+    })
+    assert tax.tree["Business"]["X"] == ["Taxes"]
+    assert tax.node("Business", "X", "Tax").doc_type == "Taxes"
