@@ -12,10 +12,13 @@
 #                           taxonomy.yaml, private_terms.txt, and
 #                           outbound_vocabulary.txt. Missing files fall
 #                           through to the image's /app/config defaults.
-#   SCAN_PROVIDER           anthropic | gemini | local-keyword
+#   SCAN_PROVIDER           anthropic | gemini | local-keyword | ollama
 #   SCAN_MODEL              Optional model id override
 #   ANTHROPIC_API_KEY       Required when SCAN_PROVIDER=anthropic
 #   GEMINI_API_KEY          Required when SCAN_PROVIDER=gemini
+#   OLLAMA_URL              Local/LAN Ollama base URL (localhost or RFC1918)
+#   OLLAMA_MODEL            Ollama model id (default llama3.2)
+#   OLLAMA_TIMEOUT          Seconds (default 60)
 #   SCAN_UID_GID            Container user:group (default 1033:100)
 #
 # Minimal weekly run (dry-run):
@@ -41,6 +44,9 @@ services:
       LOCAL_ONLY_CATEGORIES: ${LOCAL_ONLY_CATEGORIES:-Finance-Bank,ID-Legal,Medical}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OLLAMA_URL: ${OLLAMA_URL:-http://localhost:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-}
+      OLLAMA_TIMEOUT: ${OLLAMA_TIMEOUT:-}
       TZ: ${TZ:-UTC}
     volumes:
       - type: bind

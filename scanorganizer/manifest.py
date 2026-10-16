@@ -33,6 +33,7 @@ class ManifestEntry:
     provider: str = ""
     dry_run: bool = False
     notes: str = ""
+    elapsed_s: float = 0.0
     schema_version: int = MANIFEST_VERSION
 
     @classmethod
@@ -46,6 +47,7 @@ class ManifestEntry:
         provider: str = "",
         dry_run: bool = False,
         notes: str = "",
+        elapsed_s: float = 0.0,
     ) -> "ManifestEntry":
         return cls(
             ts=_utcnow_iso(),
@@ -57,6 +59,7 @@ class ManifestEntry:
             provider=provider,
             dry_run=dry_run,
             notes=notes,
+            elapsed_s=float(elapsed_s or 0.0),
         )
 
 
@@ -109,6 +112,7 @@ def read_entries(path: Path) -> Iterator[ManifestEntry]:
                 provider=data.get("provider", ""),
                 dry_run=bool(data.get("dry_run", False)),
                 notes=data.get("notes", ""),
+                elapsed_s=float(data.get("elapsed_s") or 0.0),
                 schema_version=int(data.get("schema_version", 1)),
             )
 

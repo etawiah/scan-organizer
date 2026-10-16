@@ -16,9 +16,10 @@ Owners that have no area layer (e.g. ``Personal``) use the empty string key
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import yaml
 
@@ -37,6 +38,36 @@ class TaxonomyError(ValueError):
 DEFAULT_DOC_TYPE_ALIASES: Dict[str, str] = {
     "Tax": "Taxes",
 }
+
+
+_PATH_SPLIT_RE = re.compile(r"[/\\]+")
+
+
+def normalize_path_segments(path: str | Sequence[str] | None) -> Tuple[str, ...]:
+    """Trim, drop blank segments, and collapse consecutive duplicates.
+
+    ``'A//A/B'`` → ``('A', 'B')``. ``'Finance/Finance'`` → ``('Finance',)``.
+    ``''`` → ``()``. Comparison for collapsing is case-insensitive; the first
+    spelling is kept so a later case-insensitive taxonomy match can still
+    recover the canonical names.
+    """
+    if path is None:
+        return ()
+    if isinstance(path, str):
+        raw_parts = _PATH_SPLIT_RE.split(path.strip())
+    else:
+        raw_parts = []
+        for item in path:
+            if item is None:
+                continue
+            raw_parts.extend(_PATH_SPLIT_RE.split(str(item).strip()))
+    parts = [p.strip() for p in raw_parts if p and p.strip()]
+    collapsed: List[str] = []
+    for part in parts:
+        if collapsed and collapsed[-1].lower() == part.lower():
+            continue
+        collapsed.append(part)
+    return tuple(collapsed)
 
 
 def alias_doc_type(
@@ -146,21 +177,88 @@ class Taxonomy:
     def canonicalize_doc_type(self, doc_type: str) -> str:
         return alias_doc_type(doc_type, self.doc_type_aliases)
 
+    @staticmethod
+    def _ci_key(mapping: Mapping[str, object], key: str) -> Optional[str]:
+        if key in mapping:
+            return key
+        lowered = key.lower()
+        for existing in mapping:
+            if existing.lower() == lowered:
+                return existing
+        return None
+
+    def _ci_doc_type(self, candidates: Sequence[str], doc_type: str) -> Optional[str]:
+        canonical = self.canonicalize_doc_type(doc_type)
+        hit = self._ci_key({name: True for name in candidates}, canonical)
+        if hit is not None:
+            return hit
+        if canonical != doc_type:
+            return self._ci_key({name: True for name in candidates}, doc_type)
+        return None
+
     def is_valid_node(self, owner: str, area: Optional[str], doc_type: str) -> bool:
+        return self.match_node(owner, area, doc_type) is not None
+
+    def match_node(
+        self,
+        owner: str,
+        area: Optional[str],
+        doc_type: str,
+    ) -> Optional[TaxonomyNode]:
+        """Case-insensitive lookup; returns the canonical tree names or None."""
+        owner_key = self._ci_key(self.tree, str(owner or ""))
+        if owner_key is None:
+            return None
         area_key = "" if area is None else str(area)
-        doc_type = self.canonicalize_doc_type(doc_type)
-        return (
-            owner in self.tree
-            and area_key in self.tree[owner]
-            and doc_type in self.tree[owner][area_key]
-        )
+        areas = self.tree[owner_key]
+        area_hit = self._ci_key(areas, area_key)
+        if area_hit is None:
+            return None
+        dt_hit = self._ci_doc_type(areas[area_hit], doc_type)
+        if dt_hit is None:
+            return None
+        return TaxonomyNode(owner=owner_key, area=area_hit, doc_type=dt_hit)
+
+    def match_path(self, path: str | Sequence[str] | None) -> Optional[TaxonomyNode]:
+        """Normalize a path and match it case-insensitively against the tree.
+
+        2 segments → ``(owner, '', doc_type)``. 3 segments →
+        ``(owner, area, doc_type)``. Anything else (empty, 1, or 4+) is
+        invalid and never filed.
+        """
+        parts = normalize_path_segments(path)
+        if len(parts) == 2:
+            return self.match_node(parts[0], "", parts[1])
+        if len(parts) == 3:
+            return self.match_node(parts[0], parts[1], parts[2])
+        return None
+
+    def match_classification(self, classification: Mapping[str, object]) -> Optional[TaxonomyNode]:
+        """Resolve a model payload to a taxonomy node, or None if invalid."""
+        for key in ("category", "path", "node"):
+            raw = classification.get(key)
+            if raw:
+                node = self.match_path(str(raw))
+                if node is not None:
+                    return node
+        owner = str(classification.get("owner") or "")
+        area = classification.get("area")
+        doc_type = str(classification.get("doc_type") or "")
+        joined = normalize_path_segments((owner, "" if area is None else str(area), doc_type))
+        node = self.match_path(joined)
+        if node is not None:
+            return node
+        # Last chance: treat owner itself as a full path (e.g. ``A//A/B``).
+        if owner and not str(area or "").strip() and not doc_type:
+            return self.match_path(owner)
+        return None
 
     def node(self, owner: str, area: Optional[str], doc_type: str) -> TaxonomyNode:
         area_key = "" if area is None else str(area)
-        doc_type = self.canonicalize_doc_type(doc_type)
-        if not self.is_valid_node(owner, area_key, doc_type):
+        matched = self.match_node(owner, area_key, doc_type)
+        if matched is None:
             raise TaxonomyError(f"Not a valid taxonomy node: {owner}/{area_key}/{doc_type}")
-        return TaxonomyNode(owner=owner, area=area_key, doc_type=doc_type)
+        return matched
 
     def iter_nodes(self) -> Iterable[TaxonomyNode]:
         for owner, areas in self.tree.items():

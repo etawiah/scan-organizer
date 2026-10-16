@@ -40,7 +40,13 @@ REFILE_LEGACY_DIRNAMES = {
     "Family Docs",
 }
 
-PROVIDERS = ("anthropic", "gemini", "local-keyword")
+PROVIDERS = ("anthropic", "gemini", "local-keyword", "ollama")
+LOCAL_PROVIDERS = frozenset({"local-keyword", "ollama"})
+
+
+def is_local_provider(name: str) -> bool:
+    """True for on-host classifiers. The outbound allowlist does not apply."""
+    return str(name or "") in LOCAL_PROVIDERS
 
 # Config files resolved in this order: $SCAN_CONFIG_DIR, /config,
 # /app/config, ./config. The host bind-mount in docker-compose is /config.

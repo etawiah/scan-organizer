@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import shutil
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import date
@@ -27,7 +28,7 @@ from .privacy import (
 )
 from .vocabulary import extract_outbound_signals
 from .scanner import CandidateFile, walk_inbox
-from .taxonomy import Taxonomy, TaxonomyError, TaxonomyNode
+from .taxonomy import Taxonomy, TaxonomyNode
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +62,7 @@ class FileOutcome:
     reason: str = ""
     classification: Dict[str, object] = field(default_factory=dict)
     provider: str = ""
+    elapsed_s: float = 0.0
 
 
 @dataclass
@@ -171,9 +173,14 @@ def _classify_file(
         return result
     dump_prompts = print_prompts or prompts_only
     if dump_prompts:
-        signals = extract_outbound_signals(text)
-        prompt = classifier_mod._build_prompt(taxonomy, signals)
-        assert_safe_for_outbound(prompt, sensitive_terms, taxonomy=taxonomy)
+        if settings.provider == "ollama":
+            # Local model sees the full redacted OCR; do not run the
+            # outbound token allowlist (that gate is for cloud only).
+            prompt = classifier_mod._build_local_prompt(taxonomy, report.scrubbed_text)
+        else:
+            signals = extract_outbound_signals(text)
+            prompt = classifier_mod._build_prompt(taxonomy, signals)
+            assert_safe_for_outbound(prompt, sensitive_terms, taxonomy=taxonomy)
         if prompts_writer is not None:
             prompts_writer.write({
                 "src": str(file_path),
@@ -193,6 +200,7 @@ def _classify_file(
         settings,
         terms=sensitive_terms,
         file_path=str(file_path),
+        local_ocr_text=report.scrubbed_text,
     )
     out["privacy_report"] = report.summary_for_manifest()
     return out
@@ -202,15 +210,18 @@ def _resolve_node(
     classification: Dict[str, object],
     taxonomy: Taxonomy,
 ) -> Optional[TaxonomyNode]:
-    owner = str(classification.get("owner") or "")
-    area = classification.get("area")
-    doc_type = str(classification.get("doc_type") or "")
-    if not owner or not doc_type:
+    """Normalize the model path and match it case-insensitively.
+
+    Invalid, empty, or unrecognised paths return ``None`` so the caller
+    routes the file to ``_Review/`` and never files it.
+    """
+    node = taxonomy.match_classification(classification)
+    if node is None:
         return None
-    try:
-        return taxonomy.node(owner, area, doc_type)
-    except TaxonomyError:
-        return None
+    classification["owner"] = node.owner
+    classification["area"] = node.area
+    classification["doc_type"] = node.doc_type
+    return node
 
 
 def _move_or_plan(src: Path, dest: Path, dry_run: bool) -> Path:
@@ -237,6 +248,38 @@ def _route_to_fallback(
 
 
 def process_file(
+    candidate: CandidateFile,
+    cfg: RunConfig,
+    writer: ManifestWriter,
+    known_hashes: Dict[str, Path],
+    prompts_writer: Optional[PromptDumpWriter] = None,
+) -> FileOutcome:
+    t0 = time.perf_counter()
+
+    class _TimedWriter:
+        def __init__(self) -> None:
+            self.last_elapsed = 0.0
+
+        def write(self, entry: ManifestEntry) -> None:
+            self.last_elapsed = time.perf_counter() - t0
+            entry.elapsed_s = self.last_elapsed
+            writer.write(entry)
+
+    timed = _TimedWriter()
+    outcome = _process_file(
+        candidate, cfg, timed, known_hashes, prompts_writer,
+    )
+    outcome.elapsed_s = timed.last_elapsed or (time.perf_counter() - t0)
+    log.info(
+        "file %s action=%s elapsed=%.3fs",
+        candidate.path.name,
+        outcome.action,
+        outcome.elapsed_s,
+    )
+    return outcome
+
+
+def _process_file(
     candidate: CandidateFile,
     cfg: RunConfig,
     writer: ManifestWriter,

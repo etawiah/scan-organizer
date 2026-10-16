@@ -211,7 +211,8 @@ def _print_outcomes(outcomes, dry_run: bool) -> None:
         prov = f" [{o.provider}]" if o.provider else ""
         dest = o.dest or "-"
         reason = f"  // {o.reason}" if o.reason else ""
-        print(f"  {tag:<16}{prov} {o.src} -> {dest}{reason}")
+        elapsed = f"  ({o.elapsed_s:.2f}s)" if o.elapsed_s else ""
+        print(f"  {tag:<16}{prov} {o.src} -> {dest}{reason}{elapsed}")
 
 
 def _write_summary(args: argparse.Namespace, outcomes, stamp: Optional[str] = None) -> Optional[Path]:
@@ -233,7 +234,7 @@ def _run_interactive(parser: argparse.ArgumentParser) -> int:
     scans_root = input(f"Scans root [{scans_root_default}]: ").strip() or scans_root_default
     src_default = str(Path(scans_root) / DEFAULT_SRC_NAME)
     src = input(f"Source folder [{src_default}]: ").strip() or src_default
-    provider = input("Provider (anthropic/gemini/local-keyword) [local-keyword]: ").strip() or "local-keyword"
+    provider = input("Provider (anthropic/gemini/local-keyword/ollama) [local-keyword]: ").strip() or "local-keyword"
     dry = input("Dry run? (y/N): ").strip().lower() in {"y", "yes"}
     argv = [
         "--scans-root", scans_root,
@@ -317,6 +318,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _print_outcomes(result.outcomes, cfg.dry_run)
     counts = result.tally()
     print("\nCounts:", json.dumps(counts))
+    timed = [o.elapsed_s for o in result.outcomes if o.elapsed_s]
+    if timed:
+        avg = sum(timed) / len(timed)
+        print(f"Average per-file runtime: {avg:.3f}s ({len(timed)} file{'s' if len(timed) != 1 else ''})")
     budget = cfg.settings.cloud_budget
     if budget is not None:
         print(f"Cloud HTTP requests: {budget.used}"
