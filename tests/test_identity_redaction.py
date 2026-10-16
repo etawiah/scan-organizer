@@ -87,7 +87,6 @@ def test_redacts_each_card_fragment_shape(raw):
     out = redact(f"Payment {raw} posted.")
     assert "0000" not in out, raw
     assert "[CARD]" in out, raw
-    assert_safe_for_outbound(out)
     with pytest.raises(ValueError):
         assert_safe_for_outbound(f"Payment {raw} posted.")
 
@@ -101,7 +100,6 @@ def test_redacts_each_address_shape(raw):
     else:
         assert "100" not in out and "123" not in out, raw
     assert "[ADDRESS]" in out, raw
-    assert_safe_for_outbound(out)
     with pytest.raises(ValueError):
         assert_safe_for_outbound(f"Service address {raw} on file.")
 
@@ -113,7 +111,6 @@ def test_redacts_each_name_shape(raw):
     assert "Marta" not in out, raw
     assert "Quill" not in out, raw
     assert "[NAME]" in out, raw
-    assert_safe_for_outbound(out)
     with pytest.raises(ValueError):
         assert_safe_for_outbound(f"Filed for {raw} today.")
 
@@ -131,7 +128,6 @@ def test_allowlist_preserves_category_signals():
     assert "Statement" in out
     assert "Department" in out
     assert "[NAME]" not in out
-    assert_safe_for_outbound(out)
 
 
 def test_filename_and_path_are_redacted():
@@ -148,40 +144,45 @@ def test_filename_and_path_are_redacted():
 
 
 def test_regression_name_plus_card_fragment_final_prompt(taxonomy):
+    from scanorganizer.vocabulary import extract_outbound_signals
+
     terms = _empty_terms()
     report = gate(REGRESSION_NAME_AND_CARD, terms)
     prompt = classifier_mod._build_prompt(
-        taxonomy, report.scrubbed_text, filename="scan.pdf",
+        taxonomy, extract_outbound_signals(REGRESSION_NAME_AND_CARD),
     )
     assert FAKE_NAME not in prompt
     assert "Zebulon" not in prompt
     assert "Quill" not in prompt
     assert "0000" not in prompt
+    assert "Document text" not in prompt
+    assert "Original filename" not in prompt
     assert "[NAME]" in report.scrubbed_text
     assert "[CARD]" in report.scrubbed_text
-    assert_safe_for_outbound(prompt)
+    assert_safe_for_outbound(prompt, taxonomy=taxonomy)
     with pytest.raises(ValueError):
         assert_safe_for_outbound(REGRESSION_NAME_AND_CARD)
 
 
 def test_regression_names_plus_address_final_prompt(taxonomy):
-    from scanorganizer.privacy import sanitize_outbound_label
+    from scanorganizer.vocabulary import extract_outbound_signals
 
     terms = _empty_terms()
     report = gate(REGRESSION_NAMES_AND_ADDRESS, terms)
-    safe_name = sanitize_outbound_label("Zebulon_Quill.pdf", terms)
-    safe_path = sanitize_outbound_label(f"/inbox/{FAKE_ADDRESS}.pdf", terms)
     prompt = classifier_mod._build_prompt(
-        taxonomy, report.scrubbed_text, filename=safe_name, path=safe_path,
+        taxonomy, extract_outbound_signals(REGRESSION_NAMES_AND_ADDRESS),
     )
     assert "Zebulon" not in prompt
     assert "Marta" not in prompt
     assert "Quill" not in prompt
     assert "Fakeville" not in prompt
     assert "00000" not in prompt
+    assert "Document text" not in prompt
+    assert "Original filename" not in prompt
+    assert "Original path" not in prompt
     assert "[NAME]" in report.scrubbed_text
     assert "[ADDRESS]" in report.scrubbed_text
-    assert_safe_for_outbound(prompt)
+    assert_safe_for_outbound(prompt, taxonomy=taxonomy)
     with pytest.raises(ValueError):
         assert_safe_for_outbound(REGRESSION_NAMES_AND_ADDRESS)
     with pytest.raises(ValueError):

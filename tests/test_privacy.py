@@ -114,7 +114,9 @@ def test_gate_topic_density_without_private_terms():
     )
     report = gate(text, terms)
     assert report.sensitive is True
-    assert report.sensitive_reason in {"topic-density", "residual-pii"}
+    assert report.sensitive_reason in {
+        "topic-density", "residual-pii", "medical-injury",
+    }
 
 
 def test_gate_private_term_values_never_in_scrubbed_text():
