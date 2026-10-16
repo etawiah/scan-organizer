@@ -150,6 +150,22 @@ def cloud_cap_result(provider: str) -> Dict[str, object]:
     }
 
 
+def ollama_error_result(reason: str = "") -> Dict[str, object]:
+    """Ollama failed. Route to ``_Review/`` — never fall through to a cloud provider."""
+    return {
+        "owner": "",
+        "area": "",
+        "doc_type": "",
+        "doc_date": "",
+        "confidence": 0.0,
+        "short_name": "",
+        "provider": "ollama",
+        "is_local": True,
+        "ollama_error": True,
+        "ollama_error_reason": reason,
+    }
+
+
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 
@@ -203,10 +219,10 @@ def cap_ollama_ocr_text(text: str, limit: int = OLLAMA_OCR_CHAR_CAP) -> str:
     return body[:limit]
 
 
-def _build_local_prompt(taxonomy: Taxonomy, scrubbed_ocr: str) -> str:
-    """Full-text prompt for a local model. Uses already-redacted OCR."""
+def _build_local_prompt(taxonomy: Taxonomy, ocr_text: str) -> str:
+    """Full-text prompt for a local model. OCR never leaves the house."""
     allowed = taxonomy.describe_for_prompt()
-    body = cap_ollama_ocr_text(scrubbed_ocr if scrubbed_ocr is not None else "")
+    body = cap_ollama_ocr_text(ocr_text if ocr_text is not None else "")
     return f"""You are classifying scanned household business documents into a strict taxonomy.
 
 ALLOWED taxonomy nodes owner area doc_type. You must pick EXACTLY one.
@@ -660,35 +676,31 @@ def classify(
     """Dispatch to the configured provider.
 
     ``text`` is expected to already have passed through
-    :func:`scanorganizer.privacy.gate`. Cloud providers get an allowlist
-    prompt — OCR text, filenames, and paths are never interpolated. The
-    local ``ollama`` provider is marked ``is_local`` and receives the
-    full redacted-by-private-terms OCR (``local_ocr_text`` or ``text``);
-    the outbound allowlist and cloud-call budget do not apply. A
-    private-term hit on the filename or path still keeps the document
-    local-only. A defensive token-allowlist check inside each remote
-    call ensures a forgetful caller still cannot leak leftovers.
-
-    Falls back to the local keyword classifier if a remote provider fails.
+    :func:`scanorganizer.privacy.gate` for counting. Cloud providers get
+    an allowlist prompt — OCR text, filenames, and paths are never
+    interpolated — and a private-term hit on the filename or path still
+    keeps the document local-only. The local ``ollama`` provider is
+    marked ``is_local`` and receives the **full OCR** (private terms,
+    kids' names, and local-only categories included) because the URL is
+    LAN/loopback only. The outbound allowlist and cloud-call budget do
+    not apply. Ollama never falls back to Gemini or Anthropic: an
+    error or timeout returns an empty payload that the organizer routes
+    to ``_Review/``.
     """
     if settings.provider == "local-keyword":
         result = local_rules.classify(text, taxonomy, filename)
         result["provider"] = "local-keyword"
         return result
 
-    if _labels_contain_private_term(filename, file_path, terms):
-        result = local_rules.classify(text, taxonomy, filename)
-        result["provider"] = "local-keyword"
-        result["privacy"] = "local-only: sensitive"
-        result["privacy_blocked"] = True
-        return result
-
     if settings.provider == "ollama":
-        prompt = _build_local_prompt(
-            taxonomy,
-            local_ocr_text if local_ocr_text is not None else text,
-        )
+        # Private-term / kids / local-only documents stay on the LAN model.
+        # Never invoke a cloud provider from this branch.
         try:
+            resolve_ollama_url(settings.ollama_url)
+            prompt = _build_local_prompt(
+                taxonomy,
+                local_ocr_text if local_ocr_text is not None else text,
+            )
             raw = _call_ollama(prompt, settings)
             parsed = _coerce(_extract_json(raw))
             parsed["provider"] = "ollama"
@@ -696,15 +708,18 @@ def classify(
             return parsed
         except Exception as exc:
             log.warning(
-                "Classifier provider %s failed, falling back to local-keyword: %s",
-                settings.provider,
+                "Classifier provider ollama failed; routing to review "
+                "(no cloud fallback): %s",
                 type(exc).__name__,
             )
-            fallback = local_rules.classify(text, taxonomy, filename)
-            fallback["provider"] = "local-keyword"
-            fallback["fallback_from"] = settings.provider
-            fallback["fallback_reason"] = type(exc).__name__
-            return fallback
+            return ollama_error_result(type(exc).__name__)
+
+    if _labels_contain_private_term(filename, file_path, terms):
+        result = local_rules.classify(text, taxonomy, filename)
+        result["provider"] = "local-keyword"
+        result["privacy"] = "local-only: sensitive"
+        result["privacy_blocked"] = True
+        return result
 
     if settings.cloud_budget is not None and settings.cloud_budget.exhausted():
         return cloud_cap_result(settings.provider)

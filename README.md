@@ -46,16 +46,19 @@ reachable, plus:
   default 180s / minimum 120s). The host handles **one request at a
   time**; calls are serialized and the OCR text sent per file is
   capped at about 2500 tokens (~10k characters). Ollama is marked
-  `is_local=True`: it receives the redacted-by-private-terms OCR (not
-  the cloud allowlist) and does not count against `--max-cloud-calls`.
+  `is_local=True`: it receives the **full OCR** (private terms, kids'
+  names, and `LOCAL_ONLY_CATEGORIES` included) because nothing leaves
+  the house. Hits are still **counted** and logged as counts only.
   `OLLAMA_URL` is refused unless the host is `localhost` or an
-  RFC1918/LAN address, so a mis-set URL cannot leak to a remote host.
-  Private-term hits and kids' / `LOCAL_ONLY_CATEGORIES` routing still
-  short-circuit to `local-keyword` exactly as before.
+  RFC1918/LAN address. Ollama never falls back to Gemini or Anthropic:
+  an error or timeout sends the file to `_Review/`. Cloud providers
+  keep the full gate (private-term / kids / SSN / local-only /
+  allowlist) unchanged.
 - A **single local redaction gate** runs before any outbound call. It
   guarantees that no children's PII — and no SSN, EIN, routing, account,
   or card number — ever reaches a frontier model. Any private-term hit
-  short-circuits to the local classifier (`local-only: sensitive`).
+  short-circuits a **cloud** provider to the local classifier
+  (`local-only: sensitive`). Ollama still receives the full OCR.
   Medical / injury keywords force local-only regardless of category.
   Outbound prompts are **allowlist-only**: never OCR text, filenames, or
   paths — only taxonomy names, committed generic vocabulary hits, and
@@ -110,8 +113,9 @@ For each file in `--src`:
      (whole-word, case-insensitive including ALL CAPS, `First Last` /
      `Last, First`, and lone given-name tokens; `_` / `-` count as
      boundaries in filenames and paths) are counted and replaced with
-     `[REDACTED_TERM]`. Any hit flips the document to
-     `local-only: sensitive`.
+     `[REDACTED_TERM]`. For a **cloud** provider any hit flips the
+     document to `local-only: sensitive`. For **ollama** the hit is
+     counted only; the full OCR still goes to the LAN model.
    * SSNs (`123-45-6789`, spaced, and 9-digit unformatted near SSN
      keywords), EINs (`##-#######`), account/routing numbers (digit runs
      of 8+ allowing spaces/dashes), payment cards (Luhn-valid 13–19 digit
@@ -142,9 +146,11 @@ For each file in `--src`:
    is `Finance-Bank`, `ID-Legal`, or `Medical` stay local-only;
    override with `LOCAL_ONLY_CATEGORIES`. The **ollama** provider is
    local (`is_local=True`) so the allowlist gate does not apply: it
-   receives the redacted-by-private-terms OCR, capped at ~2500 tokens
-   (~10k characters), one file at a time. Private-term and kids'
-   local-only routing is unchanged.
+   receives the **full OCR** (including private-term / kids' /
+   local-only documents), capped at ~2500 tokens (~10k characters),
+   one file at a time. Private-term hits are still counted in the
+   manifest (counts only). If Ollama errors or times out the file
+   goes to `_Review/` — never to Gemini or Anthropic.
 6. The result is validated against `taxonomy.yaml` after the path is
    normalized (trim, collapse blank or repeated segments,
    case-insensitive).
@@ -299,14 +305,18 @@ sensitive has to live in git. Common minor/medical keywords
 
 ### Owner rule — enforced by code
 
-* **No children's PII to any LLM.** Any private‑term hit, or two or more
-  hits against the built‑in topical signal list
-  (SSN / tax / medical / school‑record keywords), causes the document to
-  be classified locally and recorded in the manifest as
-  `local-only: sensitive`. Zero provider calls are made.
+* **No children's PII to any cloud LLM (Gemini / Anthropic).** Any
+  private‑term hit, or two or more hits against the built‑in topical
+  signal list (SSN / tax / medical / school‑record keywords), causes
+  the document to stay on-host and be recorded as
+  `local-only: sensitive`. Zero cloud provider calls are made.
+  **Ollama is the exception:** a validated LAN / loopback URL never
+  leaves the house, so private-term hits, kids' names, and
+  `LOCAL_ONLY_CATEGORIES` are sent to the local model with the full
+  OCR. Hits are still counted and logged as counts only.
 * **No SSN, EIN, routing, account, or card number to any frontier model.**
-  Documents that *are* sent to the provider first go through the single
-  redaction gate, which scrubs:
+  Documents that *are* sent to a **cloud** provider first go through the
+  single redaction gate, which scrubs:
   * US SSNs — `123-45-6789`, `123 45 6789`, and unformatted
     9‑digit values when they sit next to an SSN / TIN / ITIN cue.
   * EINs — `##-#######`.
@@ -327,9 +337,11 @@ sensitive has to live in git. Common minor/medical keywords
 * **Nothing sensitive is ever logged.** The gate reports counts and
   category labels only — never the matched substring or term.
 
-A defensive residual‑PII check inside every provider call re‑scans the
-final prompt immediately before it goes on the wire and refuses to
-transmit anything that still matches an ID pattern.
+A defensive residual‑PII check inside every **cloud** provider call
+re‑scans the final prompt immediately before it goes on the wire and
+refuses to transmit anything that still matches an ID pattern.
+Ollama does not use that allowlist (and never falls back to a cloud
+provider if the local call fails).
 
 ---
 
@@ -521,9 +533,11 @@ The test suite covers:
 - `tests/test_dates.py` — document date resolution precedence.
 - `tests/test_taxonomy.py` — YAML schema, node validation, and path
   normalization (`A//A/B`, empty, `Finance/Finance` → `_Review/`).
-- `tests/test_ollama.py` — local provider, full redacted OCR,
-  RFC1918/localhost URL guard, private-term / kids local-only still
-  short-circuit.
+- `tests/test_ollama.py` — local provider, LAN URL guard, OCR cap,
+  sequential calls, low-confidence → `_Review/`.
+- `tests/test_ollama_local_policy.py` — ollama gets full private-term
+  OCR; the same file under gemini never reaches the provider; ollama
+  errors go to `_Review/` and never call Gemini/Anthropic.
 - `tests/test_ocr.py` — mirrored/flipped synthetic image keeps the
   best orientation.
 - `tests/test_runtime.py` — per-file elapsed time and summary average.

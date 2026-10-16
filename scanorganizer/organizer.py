@@ -136,20 +136,20 @@ def _classify_file(
     """Single redaction gate shared by every provider path.
 
     ``text`` is OCR output. We *always* run it through
-    :func:`scanorganizer.privacy.gate` first, which decides whether the
-    document is safe to leave the host at all. Medical / injury keywords
-    force local-only regardless of category. The original filename and
-    path are checked the same way: a private-term hit on either marks the
-    file ``local-only: sensitive``. Outbound prompts are built from
-    allowlisted signals only — OCR text, filenames, and paths are never
-    interpolated. Sensitive documents fall through to the local keyword
-    classifier and the manifest records a ``local-only: sensitive`` entry
-    together with category counts (never the matched strings themselves).
+    :func:`scanorganizer.privacy.gate` first so private-term hits are
+    counted (counts only — never the matched strings). For
+    **cloud** providers (Gemini / Anthropic) the gate still decides
+    whether the document may leave the host: medical / injury keywords,
+    private-term hits on text, filename, or path, and
+    ``LOCAL_ONLY_CATEGORIES`` stay local-only. Outbound prompts are
+    allowlist-only. For **ollama** (a validated LAN / loopback URL)
+    nothing leaves the house, so private-term, kids', and local-only
+    files are sent to the local model with the **full OCR**. Ollama
+    never falls back to a cloud provider.
     """
     report: RedactionReport = gate(text, sensitive_terms)
     # Filenames and parent path segments are not OCR'd, so they must be
-    # checked the same way as document text. A private-term hit here is
-    # treated as sensitive content: local-only, never a cloud provider.
+    # counted the same way as document text.
     name_hits = sensitive_terms.count_hits(file_path.name)
     path_hits = sensitive_terms.count_hits(str(file_path))
     label_hits = max(name_hits, path_hits)
@@ -162,7 +162,8 @@ def _classify_file(
     from . import local_rules
     local_guess = local_rules.classify(text, taxonomy, file_path.name)
     category_blocked = is_local_only_category(str(local_guess.get("doc_type") or ""))
-    if report.sensitive or category_blocked:
+    local_ollama = settings.provider == "ollama"
+    if (report.sensitive or category_blocked) and not local_ollama:
         result = local_guess
         result["provider"] = "local-keyword"
         result["privacy"] = (
@@ -173,10 +174,10 @@ def _classify_file(
         return result
     dump_prompts = print_prompts or prompts_only
     if dump_prompts:
-        if settings.provider == "ollama":
-            # Local model sees the full redacted OCR; do not run the
-            # outbound token allowlist (that gate is for cloud only).
-            prompt = classifier_mod._build_local_prompt(taxonomy, report.scrubbed_text)
+        if local_ollama:
+            # Local model sees the full OCR; do not run the outbound
+            # token allowlist (that gate is for cloud only).
+            prompt = classifier_mod._build_local_prompt(taxonomy, text)
         else:
             signals = extract_outbound_signals(text)
             prompt = classifier_mod._build_prompt(taxonomy, signals)
@@ -200,7 +201,7 @@ def _classify_file(
         settings,
         terms=sensitive_terms,
         file_path=str(file_path),
-        local_ocr_text=report.scrubbed_text,
+        local_ocr_text=text if local_ollama else report.scrubbed_text,
     )
     out["privacy_report"] = report.summary_for_manifest()
     return out
@@ -350,6 +351,17 @@ def _process_file(
     confidence = float(classification.get("confidence", 0.0) or 0.0)
     provider = str(classification.get("provider") or cfg.settings.provider)
     node = _resolve_node(classification, cfg.taxonomy)
+
+    if classification.get("ollama_error"):
+        dest = _route_to_fallback(file_path, cfg.review_dir, file_path.name, cfg.dry_run)
+        reason = "ollama-error"
+        writer.write(ManifestEntry.new(
+            action="review", src=file_path, dest=dest, sha256=file_hash,
+            classification=classification, provider=provider,
+            notes=reason, dry_run=cfg.dry_run,
+        ))
+        return FileOutcome(src=file_path, dest=dest, action="review",
+                           reason=reason, classification=classification, provider=provider)
 
     if classification.get("cloud_cap"):
         dest = _route_to_fallback(file_path, cfg.review_dir, file_path.name, cfg.dry_run)
