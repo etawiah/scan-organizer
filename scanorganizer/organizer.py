@@ -142,10 +142,13 @@ def _classify_file(
     whether the document may leave the host: medical / injury keywords,
     private-term hits on text, filename, or path, and
     ``LOCAL_ONLY_CATEGORIES`` stay local-only. Outbound prompts are
-    allowlist-only. For **ollama** (a validated LAN / loopback URL)
+    allowlist-only. For **ollama** (provider is ``ollama`` *and*
+    :func:`resolve_ollama_url` succeeds for a LAN / loopback URL)
     nothing leaves the house, so private-term, kids', and local-only
-    files are sent to the local model with the **full OCR**. Ollama
-    never falls back to a cloud provider.
+    files are sent to the local model with the **full OCR**. If the
+    URL is invalid or not LAN, those files stay ``privacy_blocked``
+    and ``--print-prompts`` / ``prompts_only`` never dump unredacted
+    OCR for them. Ollama never falls back to a cloud provider.
     """
     report: RedactionReport = gate(text, sensitive_terms)
     # Filenames and parent path segments are not OCR'd, so they must be
@@ -162,7 +165,13 @@ def _classify_file(
     from . import local_rules
     local_guess = local_rules.classify(text, taxonomy, file_path.name)
     category_blocked = is_local_only_category(str(local_guess.get("doc_type") or ""))
-    local_ollama = settings.provider == "ollama"
+    local_ollama = False
+    if settings.provider == "ollama":
+        try:
+            classifier_mod.resolve_ollama_url(settings.ollama_url)
+            local_ollama = True
+        except Exception:
+            local_ollama = False
     if (report.sensitive or category_blocked) and not local_ollama:
         result = local_guess
         result["provider"] = "local-keyword"

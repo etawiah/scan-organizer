@@ -537,7 +537,9 @@ The test suite covers:
   sequential calls, low-confidence → `_Review/`.
 - `tests/test_ollama_local_policy.py` — ollama gets full private-term
   OCR; the same file under gemini never reaches the provider; ollama
-  errors go to `_Review/` and never call Gemini/Anthropic.
+  errors go to `_Review/` and never call Gemini/Anthropic. An invalid
+  or non-LAN `OLLAMA_URL` keeps private-term and local-only files
+  `privacy_blocked`; `--prompts-only` never dumps their unredacted OCR.
 - `tests/test_ocr.py` — mirrored/flipped synthetic image keeps the
   best orientation.
 - `tests/test_runtime.py` — per-file elapsed time and summary average.

@@ -116,3 +116,100 @@ def test_ollama_failure_never_invokes_cloud_even_when_keys_set(
     direct = classify(PRIVATE_TERM_KIDS, "kids.pdf", taxonomy, settings)
     assert direct.get("ollama_error") is True
     assert direct["provider"] == "ollama"
+
+
+INVALID_OLLAMA_URL = "http://8.8.8.8:11434"
+BANK_STATEMENT = "checking account monthly statement deposit withdrawal"
+
+
+def _forbid_cloud_and_ollama(monkeypatch):
+    def cloud_boom(*_a, **_k):
+        raise AssertionError("cloud provider must not be called")
+
+    def ollama_boom(*_a, **_k):
+        raise AssertionError("ollama must not be called when OLLAMA_URL is invalid")
+
+    monkeypatch.setattr(classifier_mod, "_call_gemini", cloud_boom)
+    monkeypatch.setattr(classifier_mod, "_call_anthropic", cloud_boom)
+    monkeypatch.setattr(classifier_mod, "_call_ollama", ollama_boom)
+    monkeypatch.setattr(classifier_mod.urllib.request, "urlopen", cloud_boom)
+
+
+def test_invalid_ollama_url_private_term_file_stays_privacy_blocked(
+    tmp_scan_tree, runconfig_factory, monkeypatch,
+):
+    monkeypatch.setenv("OLLAMA_URL", INVALID_OLLAMA_URL)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-must-not-be-used")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-must-not-be-used")
+    _seed_private_file(tmp_scan_tree, monkeypatch)
+    _forbid_cloud_and_ollama(monkeypatch)
+
+    cfg = runconfig_factory(provider="ollama", extra_terms=[PRIVATE_TERM])
+    result = process_batch(cfg)
+    assert result.outcomes
+    outcome = result.outcomes[0]
+    assert outcome.provider == "local-keyword"
+    assert outcome.classification.get("privacy_blocked") is True
+    assert outcome.classification.get("privacy") == "local-only: sensitive"
+
+
+def test_invalid_ollama_url_local_only_category_file_stays_privacy_blocked(
+    tmp_scan_tree, runconfig_factory, monkeypatch,
+):
+    monkeypatch.setenv("OLLAMA_URL", INVALID_OLLAMA_URL)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-must-not-be-used")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-must-not-be-used")
+    _write(tmp_scan_tree["src"] / "bank.pdf", BANK_STATEMENT)
+
+    def fake_extract(path: Path, max_pages: int = 5, dpi: int = 300) -> str:
+        return BANK_STATEMENT
+
+    monkeypatch.setattr(ocr_mod, "extract_text", fake_extract)
+    _forbid_cloud_and_ollama(monkeypatch)
+
+    cfg = runconfig_factory(provider="ollama")
+    result = process_batch(cfg)
+    outcome = next(o for o in result.outcomes if o.src.name == "bank.pdf")
+    assert outcome.provider == "local-keyword"
+    assert outcome.classification.get("privacy_blocked") is True
+    assert outcome.classification.get("privacy") == "local-only: category"
+
+
+def test_prompts_only_invalid_ollama_url_prints_no_unredacted_text(
+    tmp_scan_tree, runconfig_factory, monkeypatch,
+):
+    monkeypatch.setenv("OLLAMA_URL", INVALID_OLLAMA_URL)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-must-not-be-used")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-must-not-be-used")
+    _seed_private_file(tmp_scan_tree, monkeypatch)
+    _write(tmp_scan_tree["src"] / "bank.pdf", BANK_STATEMENT)
+
+    def fake_extract(path: Path, max_pages: int = 5, dpi: int = 300) -> str:
+        if path.name == "bank.pdf":
+            return BANK_STATEMENT
+        return PRIVATE_TERM_KIDS
+
+    monkeypatch.setattr(ocr_mod, "extract_text", fake_extract)
+    _forbid_cloud_and_ollama(monkeypatch)
+
+    prompts_path = tmp_scan_tree["log"] / "prompts-invalid-ollama.jsonl"
+    cfg = runconfig_factory(provider="ollama", dry_run=True, extra_terms=[PRIVATE_TERM])
+    cfg.prompts_only = True
+    cfg.print_prompts = False
+    cfg.prompts_path = prompts_path
+    result = process_batch(cfg)
+
+    assert result.outcomes
+    assert any(o.classification.get("privacy_blocked") is True for o in result.outcomes)
+    leaked = (
+        "Zebulon Quill",
+        PRIVATE_TERM_KIDS,
+        "Placeholder Elementary",
+        "immunization record",
+        BANK_STATEMENT,
+        "checking account monthly statement",
+        "deposit withdrawal",
+    )
+    body = prompts_path.read_text(encoding="utf-8") if prompts_path.exists() else ""
+    for fragment in leaked:
+        assert fragment not in body, fragment
