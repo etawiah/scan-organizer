@@ -17,7 +17,7 @@ from .dates import resolve_doc_date
 from .hashing import sha256_file
 from .manifest import ManifestEntry, ManifestWriter, seen_hashes
 from .naming import build_dest_path, build_filename, disambiguate, sanitize_short_name
-from .privacy import PrivacyDecision, SensitiveTerms, evaluate
+from .privacy import RedactionReport, SensitiveTerms, gate
 from .scanner import CandidateFile, walk_inbox
 from .taxonomy import Taxonomy, TaxonomyError, TaxonomyNode
 
@@ -79,16 +79,28 @@ def _classify_file(
     settings: ClassifierSettings,
     sensitive_terms: SensitiveTerms,
 ) -> Dict[str, object]:
-    decision: PrivacyDecision = evaluate(text, sensitive_terms)
-    if not decision.outbound_ok:
+    """Single redaction gate shared by every provider path.
+
+    ``text`` is OCR output. We *always* run it through
+    :func:`scanorganizer.privacy.gate` first, which both scrubs the
+    outbound copy and decides whether the document is safe to leave the
+    host at all. Sensitive documents fall through to the local keyword
+    classifier and the manifest records a ``local-only: sensitive`` entry
+    together with category counts (never the matched strings themselves).
+    """
+    report: RedactionReport = gate(text, sensitive_terms)
+    if report.sensitive:
         from . import local_rules
         result = local_rules.classify(text, taxonomy, file_path.name)
         result["provider"] = "local-keyword"
+        result["privacy"] = "local-only: sensitive"
         result["privacy_blocked"] = True
-        result["matched_terms"] = list(decision.matched_terms)
+        result["privacy_report"] = report.summary_for_manifest()
         return result
-    scrubbed = decision.scrubbed_text or ""
-    return classifier_mod.classify(scrubbed, file_path.name, taxonomy, settings)
+    scrubbed = report.scrubbed_text or ""
+    out = classifier_mod.classify(scrubbed, file_path.name, taxonomy, settings)
+    out["privacy_report"] = report.summary_for_manifest()
+    return out
 
 
 def _resolve_node(

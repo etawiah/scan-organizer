@@ -115,9 +115,14 @@ def _resolve_paths(args: argparse.Namespace) -> argparse.Namespace:
         args.taxonomy = here / "taxonomy.yaml"
     if args.private_terms is None:
         here = Path(__file__).resolve().parent.parent
-        candidate = here / "private_terms.txt"
-        if candidate.exists():
-            args.private_terms = candidate
+        candidates = [
+            here / "config" / "private_terms.txt",
+            here / "private_terms.txt",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                args.private_terms = candidate
+                break
     return args
 
 
@@ -240,8 +245,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"  manifest   : {cfg.manifest_path}")
     print(f"  taxonomy   : {args.taxonomy}  (threshold={cfg.taxonomy.confidence_threshold})")
     terms_count = len(cfg.sensitive_terms.terms)
-    print(f"  privacy    : {terms_count} sensitive term(s) loaded"
-          + ("" if args.private_terms else " (no private_terms.txt found)"))
+    print(
+        f"  privacy    : redaction gate=on  terms_loaded={terms_count}"
+        + ("" if args.private_terms else "  (no private_terms.txt found)")
+    )
 
     if args.refile:
         result = refile_folders(args.refile, cfg)
