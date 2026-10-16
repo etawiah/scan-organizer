@@ -55,9 +55,14 @@ reachable, plus:
 - Per-run `summary-<UTC timestamp>.md` (same stamp scheme as the manifest)
   with per‑folder counts and the `_Review` list. Runs never overwrite each
   other.
-- `--print-prompts --dry-run` writes the exact final outbound prompt for
+- `--prompts-only --dry-run` writes the exact final outbound prompt for
   each file that would hit a provider to `prompts-<UTC timestamp>.jsonl`
-  (mode `0600`) and makes zero network calls.
+  (mode `0600`) and makes zero network calls. `--print-prompts` writes
+  the same file and then continues to classify.
+- `--max-cloud-calls N` (`SCAN_MAX_CLOUD_CALLS`) counts every HTTP
+  request, including retries, and sends remaining outbound files to
+  `_Review/` when the cap is reached. `--no-retry` /
+  `SCAN_GEMINI_RETRIES` (default 3) controls Gemini 429/503 retries.
 - `--provider-probe` sends a content-free `ping` and prints HTTP status.
 - `Dockerfile`, `docker-compose.yml`, cron + systemd‑timer samples.
 - `test_api_key.py` no longer prints any portion of the API key (supersedes
@@ -172,7 +177,10 @@ Behavior:
 | `--confidence-threshold FLOAT` | Overrides the YAML threshold. |
 | `--ocr-pages N` | PDF pages to OCR. Default `5`. |
 | `--dry-run` | Write the manifest and print the plan; move nothing. |
-| `--print-prompts` | Requires `--dry-run`. Write `prompts-<UTC timestamp>.jsonl` (mode 0600) with the exact final outbound prompt for each file that would go to a provider. Zero network calls. |
+| `--print-prompts` | Write `prompts-<UTC timestamp>.jsonl` (mode 0600) with the exact final outbound prompt, then classify normally. |
+| `--prompts-only` | Requires `--dry-run`. Write the same prompt dump and make zero network calls. |
+| `--max-cloud-calls N` | Cap HTTP requests (including retries). Default `$SCAN_MAX_CLOUD_CALLS` or unlimited. Remaining outbound files go to `_Review/`. |
+| `--no-retry` | Do not retry Gemini 429/503. Same as `SCAN_GEMINI_RETRIES=0` (default 3). |
 | `--provider-probe` | Send a content-free `ping` to `--provider`, print status, exit. |
 | `--limit N` | Process at most N files (good for incremental backfills). |
 | `--non-interactive` | Never prompt. Required for Docker / cron / systemd. |
@@ -199,6 +207,10 @@ Environment variables honored:
   `private_terms.txt`. Never commit real names.
 - `LOCAL_ONLY_CATEGORIES` — comma-separated doc_types that stay
   on-host (default `Finance-Bank,ID-Legal,Medical`). Empty disables.
+- `SCAN_MAX_CLOUD_CALLS` — cap HTTP requests (including retries).
+  Unset = unlimited. Remaining outbound files go to `_Review/`.
+- `SCAN_GEMINI_RETRIES` — Gemini 429/503 retries after the first
+  attempt (default 3). `0` is the same as `--no-retry`.
 - `ANTHROPIC_API_KEY` — required when `--provider anthropic`.
 - `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) — required when `--provider gemini`.
 
@@ -444,8 +456,11 @@ The test suite covers:
   overwrites a sibling run.
 - `tests/test_gemini_retry.py` — `GEMINI_MODEL`, 503/429 backoff,
   ProviderError logs status+body (not the prompt), `--provider-probe`.
-- `tests/test_print_prompts.py` — `--print-prompts` requires `--dry-run`,
-  writes mode-0600 JSONL, and never calls `urlopen`.
+- `tests/test_print_prompts.py` — `--prompts-only` requires `--dry-run`
+  and never calls `urlopen`; `--print-prompts` dumps prompts then
+  classifies.
+- `tests/test_cloud_calls.py` — `--max-cloud-calls` counts retries;
+  remaining outbound files go to `_Review/`.
 - `tests/test_allowlist_outbound.py` — allowlist prompts and fake-data
   regressions for every leftover leak shape (ALL CAPS / PO Box
   addresses, last-4, VIN, surname email, law firm, medical text in a

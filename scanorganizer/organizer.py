@@ -49,6 +49,7 @@ class RunConfig:
     hash_skip_dirs: Set[Path] = field(default_factory=set)
     run_stamp: str = ""
     print_prompts: bool = False
+    prompts_only: bool = False
     prompts_path: Optional[Path] = None
 
 
@@ -84,7 +85,7 @@ def _ocr_or_empty(path: Path, max_pages: int) -> str:
 
 
 class PromptDumpWriter:
-    """Append-only JSONL writer for ``--print-prompts`` (mode 0600)."""
+    """Append-only JSONL writer for prompt dumps (mode 0600)."""
 
     def __init__(self, path: Path):
         self.path = path
@@ -127,6 +128,7 @@ def _classify_file(
     settings: ClassifierSettings,
     sensitive_terms: SensitiveTerms,
     print_prompts: bool = False,
+    prompts_only: bool = False,
     prompts_writer: Optional[PromptDumpWriter] = None,
 ) -> Dict[str, object]:
     """Single redaction gate shared by every provider path.
@@ -167,7 +169,8 @@ def _classify_file(
         result["privacy_blocked"] = True
         result["privacy_report"] = report.summary_for_manifest()
         return result
-    if print_prompts:
+    dump_prompts = print_prompts or prompts_only
+    if dump_prompts:
         signals = extract_outbound_signals(text)
         prompt = classifier_mod._build_prompt(taxonomy, signals)
         assert_safe_for_outbound(prompt, sensitive_terms, taxonomy=taxonomy)
@@ -177,11 +180,12 @@ def _classify_file(
                 "filename": file_path.name,
                 "prompt": prompt,
             })
-        result = local_guess
-        result["provider"] = "local-keyword"
-        result["print_prompts"] = True
-        result["privacy_report"] = report.summary_for_manifest()
-        return result
+        if prompts_only:
+            result = local_guess
+            result["provider"] = "local-keyword"
+            result["prompts_only"] = True
+            result["privacy_report"] = report.summary_for_manifest()
+            return result
     out = classifier_mod.classify(
         text,
         file_path.name,
@@ -287,6 +291,7 @@ def process_file(
         classification = _classify_file(
             text, file_path, cfg.taxonomy, cfg.settings, cfg.sensitive_terms,
             print_prompts=bool(cfg.print_prompts),
+            prompts_only=bool(cfg.prompts_only),
             prompts_writer=prompts_writer,
         )
     except Exception as exc:
@@ -302,6 +307,17 @@ def process_file(
     confidence = float(classification.get("confidence", 0.0) or 0.0)
     provider = str(classification.get("provider") or cfg.settings.provider)
     node = _resolve_node(classification, cfg.taxonomy)
+
+    if classification.get("cloud_cap"):
+        dest = _route_to_fallback(file_path, cfg.review_dir, file_path.name, cfg.dry_run)
+        reason = "cloud-call-cap"
+        writer.write(ManifestEntry.new(
+            action="review", src=file_path, dest=dest, sha256=file_hash,
+            classification=classification, provider=provider,
+            notes=reason, dry_run=cfg.dry_run,
+        ))
+        return FileOutcome(src=file_path, dest=dest, action="review",
+                           reason=reason, classification=classification, provider=provider)
 
     if node is None or confidence < cfg.taxonomy.confidence_threshold:
         reason = (
@@ -355,7 +371,7 @@ def process_batch(cfg: RunConfig) -> BatchResult:
     processed = 0
     prompts_ctx = (
         PromptDumpWriter(cfg.prompts_path)
-        if cfg.print_prompts and cfg.prompts_path
+        if (cfg.print_prompts or cfg.prompts_only) and cfg.prompts_path
         else nullcontext()
     )
     with ManifestWriter(cfg.manifest_path) as writer, prompts_ctx as prompts_writer:
@@ -409,7 +425,7 @@ def refile_folders(
     processed = 0
     prompts_ctx = (
         PromptDumpWriter(cfg.prompts_path)
-        if cfg.print_prompts and cfg.prompts_path
+        if (cfg.print_prompts or cfg.prompts_only) and cfg.prompts_path
         else nullcontext()
     )
     with ManifestWriter(cfg.manifest_path) as writer, prompts_ctx as prompts_writer:

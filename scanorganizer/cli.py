@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 from . import __version__
-from .classifier import ClassifierSettings, provider_probe
+from .classifier import ClassifierSettings, CloudCallBudget, provider_probe
 from .config import (
     DEFAULT_CONFIDENCE_THRESHOLD,
     DEFAULT_LOG_DIRNAME,
@@ -79,10 +79,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true",
                    help="Write the manifest and print the plan without moving anything.")
     p.add_argument("--print-prompts", action="store_true",
+                   help="Write the exact final outbound prompt for each file that "
+                        "would go to a provider to prompts-<UTC timestamp>.jsonl "
+                        "(mode 0600), then continue to classify normally.")
+    p.add_argument("--prompts-only", action="store_true",
                    help="Offline mode (requires --dry-run): write the exact final "
-                        "outbound prompt for each file that would go to a provider "
-                        "to prompts-<UTC timestamp>.jsonl (mode 0600). Makes zero "
-                        "network calls even if API keys are set.")
+                        "outbound prompts to prompts-<UTC timestamp>.jsonl "
+                        "(mode 0600) and do not call the provider.")
+    p.add_argument("--max-cloud-calls", type=int, default=None, metavar="N",
+                   help="Cap HTTP requests to the provider, including retries "
+                        "(default: $SCAN_MAX_CLOUD_CALLS or unlimited). Remaining "
+                        "outbound files go to _Review/.")
+    p.add_argument("--no-retry", action="store_true",
+                   help="Do not retry Gemini 429/503 responses. Same as "
+                        "SCAN_GEMINI_RETRIES=0. Default is 3 retries.")
     p.add_argument("--provider-probe", action="store_true",
                    help="Send a content-free 'ping' to the chosen provider, print "
                         "HTTP status / error body, and exit. Does not process files.")
@@ -147,13 +157,18 @@ def _build_runconfig(args: argparse.Namespace) -> RunConfig:
     if args.confidence_threshold is not None:
         taxonomy.confidence_threshold = float(args.confidence_threshold)
     terms = SensitiveTerms.load(args.private_terms)
-    settings = ClassifierSettings(provider=args.provider, model=args.model)
+    settings = ClassifierSettings(
+        provider=args.provider,
+        model=args.model,
+        no_retry=bool(getattr(args, "no_retry", False)),
+        cloud_budget=_cloud_budget_from_args(args),
+    )
 
     stamp = utc_run_stamp()
     args.run_stamp = stamp
     manifest_path = args.log / f"manifest-{stamp}.jsonl"
     prompts_path = None
-    if getattr(args, "print_prompts", False):
+    if getattr(args, "print_prompts", False) or getattr(args, "prompts_only", False):
         prompts_path = args.log / f"prompts-{stamp}.jsonl"
 
     return RunConfig(
@@ -172,8 +187,20 @@ def _build_runconfig(args: argparse.Namespace) -> RunConfig:
         hash_skip_dirs={args.dest},
         run_stamp=stamp,
         print_prompts=bool(getattr(args, "print_prompts", False)),
+        prompts_only=bool(getattr(args, "prompts_only", False)),
         prompts_path=prompts_path,
     )
+
+
+def _cloud_budget_from_args(args: argparse.Namespace) -> Optional[CloudCallBudget]:
+    raw = getattr(args, "max_cloud_calls", None)
+    if raw is None:
+        env = os.environ.get("SCAN_MAX_CLOUD_CALLS")
+        if env is not None and str(env).strip() != "":
+            raw = int(str(env).strip())
+    if raw is None:
+        return None
+    return CloudCallBudget(max_calls=max(0, int(raw)))
 
 
 def _print_outcomes(outcomes, dry_run: bool) -> None:
@@ -228,8 +255,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     _configure_logging(args.verbose)
 
-    if args.print_prompts and not args.dry_run:
-        parser.error("--print-prompts requires --dry-run")
+    if args.prompts_only and not args.dry_run:
+        parser.error("--prompts-only requires --dry-run")
 
     if args.provider_probe:
         settings = ClassifierSettings(provider=args.provider, model=args.model)
@@ -266,8 +293,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"  review_dir : {cfg.review_dir}")
     print(f"  unsorted   : {cfg.unsorted_dir}")
     print(f"  manifest   : {cfg.manifest_path}")
-    if cfg.print_prompts and cfg.prompts_path:
-        print(f"  prompts    : {cfg.prompts_path}  (offline, no network)")
+    if cfg.prompts_path:
+        mode = "offline, no network" if cfg.prompts_only else "then classify"
+        print(f"  prompts    : {cfg.prompts_path}  ({mode})")
+    budget = cfg.settings.cloud_budget
+    if budget is not None and budget.max_calls is not None:
+        print(f"  cloud_cap  : {budget.max_calls} HTTP request(s)")
     print(f"  taxonomy   : {args.taxonomy}  (threshold={cfg.taxonomy.confidence_threshold})")
     vocab_path = resolve_vocabulary_path()
     load_outbound_vocabulary()
@@ -286,6 +317,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _print_outcomes(result.outcomes, cfg.dry_run)
     counts = result.tally()
     print("\nCounts:", json.dumps(counts))
+    budget = cfg.settings.cloud_budget
+    if budget is not None:
+        print(f"Cloud HTTP requests: {budget.used}"
+              + (f" / {budget.max_calls}" if budget.max_calls is not None else ""))
 
     summary_path = _write_summary(args, result.outcomes, stamp=cfg.run_stamp)
     if summary_path:

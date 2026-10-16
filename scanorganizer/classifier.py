@@ -49,7 +49,8 @@ DEFAULT_ANTHROPIC_MODEL = "claude-3-haiku-20240307"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 # Retry transient Gemini capacity / rate-limit failures. "Up to 3 times"
-# means 3 retries after the first failure (4 attempts total).
+# means 3 retries after the first failure (4 attempts total). Override
+# with SCAN_GEMINI_RETRIES or disable with --no-retry.
 GEMINI_RETRY_STATUSES = frozenset({429, 503})
 GEMINI_MAX_RETRIES = 3
 GEMINI_BACKOFF_S = 1.0
@@ -57,6 +58,62 @@ GEMINI_BACKOFF_S = 1.0
 
 class ProviderError(RuntimeError):
     """Raised by remote providers when they fail (missing key, HTTP error …)."""
+
+
+class CloudCallCapError(ProviderError):
+    """Raised when ``--max-cloud-calls`` / ``SCAN_MAX_CLOUD_CALLS`` is exhausted."""
+
+
+@dataclass
+class CloudCallBudget:
+    """Count every HTTP request, including retries.
+
+    ``max_calls is None`` means unlimited. ``used`` still increments so
+    operators can see how many requests a run issued.
+    """
+
+    max_calls: Optional[int] = None
+    used: int = 0
+    _logged_cap: bool = False
+
+    def exhausted(self) -> bool:
+        hit = self.max_calls is not None and self.used >= self.max_calls
+        if hit:
+            self._log_cap()
+        return hit
+
+    def consume(self) -> bool:
+        """Reserve one HTTP request. False if the cap is already reached."""
+        if self.max_calls is not None and self.used >= self.max_calls:
+            self._log_cap()
+            return False
+        self.used += 1
+        return True
+
+    def _log_cap(self) -> None:
+        if self._logged_cap:
+            return
+        self._logged_cap = True
+        log.warning(
+            "cloud call cap reached: %s HTTP request(s) (cap %s); "
+            "remaining outbound files go to review",
+            self.used,
+            self.max_calls,
+        )
+
+
+def cloud_cap_result(provider: str) -> Dict[str, object]:
+    """Classification payload that the organizer routes to ``_Review/``."""
+    return {
+        "owner": "",
+        "area": "",
+        "doc_type": "",
+        "doc_date": "",
+        "confidence": 0.0,
+        "short_name": "",
+        "provider": provider,
+        "cloud_cap": True,
+    }
 
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
@@ -108,6 +165,9 @@ class ClassifierSettings:
     model: Optional[str] = None
     timeout_s: int = 30
     max_tokens: int = 400
+    gemini_retries: Optional[int] = None
+    no_retry: bool = False
+    cloud_budget: Optional[CloudCallBudget] = None
 
 
 def _resolve_anthropic_model(settings: ClassifierSettings) -> str:
@@ -117,6 +177,31 @@ def _resolve_anthropic_model(settings: ClassifierSettings) -> str:
         or os.environ.get("SCAN_MODEL")
         or DEFAULT_ANTHROPIC_MODEL
     )
+
+
+def _resolve_gemini_retries(settings: ClassifierSettings) -> int:
+    """Number of *retries* after the first attempt. ``0`` means one shot."""
+    if settings.no_retry:
+        return 0
+    if settings.gemini_retries is not None:
+        return max(0, int(settings.gemini_retries))
+    raw = os.environ.get("SCAN_GEMINI_RETRIES")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(0, int(str(raw).strip()))
+        except ValueError:
+            return GEMINI_MAX_RETRIES
+    return GEMINI_MAX_RETRIES
+
+
+def _urlopen(settings: ClassifierSettings, req: urllib.request.Request, timeout: int):
+    """Issue one HTTP request, counting it against the cloud-call budget."""
+    budget = settings.cloud_budget
+    if budget is not None and not budget.consume():
+        raise CloudCallCapError(
+            f"cloud call cap reached ({budget.used}/{budget.max_calls})"
+        )
+    return urllib.request.urlopen(req, timeout=timeout)
 
 
 def _resolve_gemini_model(settings: ClassifierSettings) -> str:
@@ -169,8 +254,10 @@ def _call_anthropic(
     )
     assert_safe_for_outbound(prompt, terms, taxonomy=taxonomy)
     try:
-        with urllib.request.urlopen(req, timeout=settings.timeout_s) as resp:
+        with _urlopen(settings, req, settings.timeout_s) as resp:
             result = json.loads(resp.read().decode("utf-8"))
+    except CloudCallCapError:
+        raise
     except urllib.error.HTTPError as exc:
         raise ProviderError(f"Anthropic HTTP {exc.code}") from exc
     except Exception as exc:
@@ -207,7 +294,8 @@ def _call_gemini(
     last_status: Optional[int] = None
     last_body = ""
     result: Optional[Dict[str, object]] = None
-    for attempt in range(GEMINI_MAX_RETRIES + 1):
+    retries = _resolve_gemini_retries(settings)
+    for attempt in range(retries + 1):
         req = urllib.request.Request(
             url,
             data=json.dumps(body).encode("utf-8"),
@@ -218,9 +306,11 @@ def _call_gemini(
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=settings.timeout_s) as resp:
+            with _urlopen(settings, req, settings.timeout_s) as resp:
                 result = json.loads(resp.read().decode("utf-8"))
             break
+        except CloudCallCapError:
+            raise
         except urllib.error.HTTPError as exc:
             last_status = exc.code
             last_body = _read_http_error_body(exc)
@@ -228,10 +318,10 @@ def _call_gemini(
                 "Gemini HTTP %s (attempt %s/%s) body=%s",
                 exc.code,
                 attempt + 1,
-                GEMINI_MAX_RETRIES + 1,
+                retries + 1,
                 last_body,
             )
-            if exc.code in GEMINI_RETRY_STATUSES and attempt < GEMINI_MAX_RETRIES:
+            if exc.code in GEMINI_RETRY_STATUSES and attempt < retries:
                 time.sleep(GEMINI_BACKOFF_S * (2 ** attempt))
                 continue
             raise ProviderError(f"Gemini HTTP {exc.code}: {last_body}") from exc
@@ -334,6 +424,9 @@ def classify(
         result["privacy_blocked"] = True
         return result
 
+    if settings.cloud_budget is not None and settings.cloud_budget.exhausted():
+        return cloud_cap_result(settings.provider)
+
     prompt = _build_prompt(taxonomy, extract_outbound_signals(text))
     try:
         if settings.provider == "anthropic":
@@ -346,6 +439,8 @@ def classify(
         parsed = _coerce(parsed)
         parsed["provider"] = settings.provider
         return parsed
+    except CloudCallCapError:
+        return cloud_cap_result(settings.provider)
     except Exception as exc:
         log.warning(
             "Classifier provider %s failed, falling back to local-keyword: %s",
