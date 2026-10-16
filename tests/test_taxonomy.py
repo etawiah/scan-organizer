@@ -1,0 +1,48 @@
+"""Taxonomy loader + validator."""
+from __future__ import annotations
+
+import pytest
+
+from scanorganizer.taxonomy import Taxonomy, TaxonomyError
+
+
+def test_default_taxonomy_loads(taxonomy):
+    assert "Business" in taxonomy.owners()
+    assert "Personal" in taxonomy.owners()
+    assert "Household" in taxonomy.owners()
+    assert "Campaign" in taxonomy.owners()
+    assert "Family" in taxonomy.owners()
+
+
+def test_valid_nodes_cover_spec(taxonomy):
+    assert taxonomy.is_valid_node("Business", "ComplexTech", "Invoices-Out")
+    assert taxonomy.is_valid_node("Business", "432SouthStVT", "PropertyTax")
+    assert taxonomy.is_valid_node("Personal", "", "Taxes")
+    assert taxonomy.is_valid_node("Personal", None, "Medical")
+    assert taxonomy.is_valid_node("Household", "Vehicles", "Registration")
+
+
+def test_invalid_nodes_rejected(taxonomy):
+    assert not taxonomy.is_valid_node("Business", "ComplexTech", "Nope")
+    assert not taxonomy.is_valid_node("Business", "WrongArea", "Invoices-Out")
+    assert not taxonomy.is_valid_node("Nonsense", "", "X")
+
+
+def test_personal_has_no_area(taxonomy):
+    node = taxonomy.node("Personal", "", "Taxes")
+    assert node.as_relpath().as_posix() == "Personal/Taxes"
+
+
+def test_business_has_area(taxonomy):
+    node = taxonomy.node("Business", "ComplexTech", "Invoices-Out")
+    assert node.as_relpath().as_posix() == "Business/ComplexTech/Invoices-Out"
+
+
+def test_threshold_bounds():
+    with pytest.raises(TaxonomyError):
+        Taxonomy.from_mapping({"tree": {"X": {"": ["a"]}}, "confidence_threshold": 2.0})
+
+
+def test_tree_required():
+    with pytest.raises(TaxonomyError):
+        Taxonomy.from_mapping({})

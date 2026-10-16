@@ -1,0 +1,28 @@
+# Private sensitive-terms list — must NEVER be committed. Only the example
+# file (private_terms.example.txt) is tracked.
+private_terms.txt
+
+# Local scratch / data
+/scans/
+/dest/
+/config/
+*.jsonl
+summary-*.md
+.scan_organizer_config.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

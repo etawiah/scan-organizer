@@ -1,0 +1,32 @@
+# Private sensitive-terms list for scan-organizer.
+#
+# Copy this file to `private_terms.txt` (which is .gitignored) and replace the
+# placeholders below with the real names, schools, and keywords you want the
+# privacy filter to catch. Case-insensitive. Lines starting with # and blank
+# lines are ignored.
+#
+# When ANY term in this file matches the OCR'd text of a document, scan-organizer
+# will NOT call the external AI provider. The document is classified locally
+# with keyword rules instead, so no sensitive text leaves the host.
+
+# ---- People (replace with real names) ----
+Jane Placeholder-Doe
+John Example Smith
+
+# ---- Schools (replace with real schools) ----
+Placeholder Elementary
+Example Middle School
+Sample High School
+
+# ---- Medical / minor-related keywords (keep or adjust) ----
+school
+pediatric
+report card
+immunization
+DOB
+guardian
+parent-teacher
+IEP
+Section 504
+minor child
+custody

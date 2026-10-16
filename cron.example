@@ -1,0 +1,28 @@
+# scan-organizer weekly cron entry.
+#
+# Install:
+#   sudo cp cron.example /etc/cron.d/scan-organizer
+#   sudo chmod 644 /etc/cron.d/scan-organizer
+#
+# Pre-flight checklist (one-time, as root):
+#   1. Mount the NAS share over NFS, e.g. in /etc/fstab:
+#        nas.local:/volume1/scans  /mnt/nas/scans  nfs  defaults,_netdev,soft  0 0
+#      Verify with:  mountpoint -q /mnt/nas/scans && echo OK
+#   2. Build the image once:
+#        cd /opt/scan-organizer && docker compose build
+#   3. Drop API keys (if using anthropic/gemini) into /etc/default/scan-organizer:
+#        SCANS_HOST_PATH=/mnt/nas/scans
+#        CONFIG_HOST_PATH=/opt/scan-organizer/config
+#        SCAN_PROVIDER=anthropic
+#        ANTHROPIC_API_KEY=sk-ant-...
+#      Make it root-readable only:
+#        sudo chmod 600 /etc/default/scan-organizer
+#
+# Cron runs Sunday 03:17 UTC. Adjust to taste.
+# Note: this file lives in /etc/cron.d, so the first field after the time
+# is the user to run as.
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+17 3 * * 0 root set -a; . /etc/default/scan-organizer; set +a; cd /opt/scan-organizer && /usr/bin/docker compose run --rm scan-organizer >> /var/log/scan-organizer.log 2>&1
