@@ -29,6 +29,9 @@ from .config import (
     DEFAULT_SRC_NAME,
     DEFAULT_UNSORTED_NAME,
     PROVIDERS,
+    resolve_private_terms_path,
+    resolve_taxonomy_path,
+    resolve_vocabulary_path,
     utc_run_stamp,
 )
 from .manifest import undo as undo_manifest
@@ -36,6 +39,7 @@ from .organizer import RunConfig, process_batch, refile_folders
 from .privacy import SensitiveTerms
 from .summary import summarize, write_summary
 from .taxonomy import Taxonomy
+from .vocabulary import load_outbound_vocabulary
 
 log = logging.getLogger("scan_organizer")
 
@@ -120,18 +124,9 @@ def _resolve_paths(args: argparse.Namespace) -> argparse.Namespace:
     if args.log is None:
         args.log = args.dest / DEFAULT_LOG_DIRNAME
     if args.taxonomy is None:
-        here = Path(__file__).resolve().parent.parent
-        args.taxonomy = here / "taxonomy.yaml"
+        args.taxonomy = resolve_taxonomy_path()
     if args.private_terms is None:
-        here = Path(__file__).resolve().parent.parent
-        candidates = [
-            here / "config" / "private_terms.txt",
-            here / "private_terms.txt",
-        ]
-        for candidate in candidates:
-            if candidate.exists():
-                args.private_terms = candidate
-                break
+        args.private_terms = resolve_private_terms_path()
     return args
 
 
@@ -274,6 +269,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if cfg.print_prompts and cfg.prompts_path:
         print(f"  prompts    : {cfg.prompts_path}  (offline, no network)")
     print(f"  taxonomy   : {args.taxonomy}  (threshold={cfg.taxonomy.confidence_threshold})")
+    vocab_path = resolve_vocabulary_path()
+    load_outbound_vocabulary()
+    print(f"  vocabulary : {vocab_path}")
     terms_count = len(cfg.sensitive_terms.terms)
     print(
         f"  privacy    : redaction gate=on  terms_loaded={terms_count}"

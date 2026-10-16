@@ -25,10 +25,12 @@ COPY scanorganizer /app/scanorganizer
 COPY taxonomy.yaml /app/taxonomy.yaml
 COPY private_terms.example.txt /app/private_terms.example.txt
 
-# Allow runtime config overrides via /config bind mount.
-# At container start we overlay /config over /app for taxonomy.yaml and
-# private_terms.txt without copying anything the user did not provide.
-RUN install -d /scans /config
+# Baked-in defaults. Runtime resolution prefers $SCAN_CONFIG_DIR, then
+# /config (compose bind-mount), then /app/config, then ./config.
+RUN install -d /scans /config /app/config
+COPY taxonomy.yaml /app/config/taxonomy.yaml
+COPY config/outbound_vocabulary.txt /app/config/outbound_vocabulary.txt
+COPY config/private_terms.example.txt /app/config/private_terms.example.txt
 
 ENTRYPOINT ["python3", "/app/scan_organizer.py"]
 CMD ["--non-interactive"]

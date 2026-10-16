@@ -24,6 +24,9 @@ def _clear_private_terms_env(monkeypatch):
     """Tests must never pick up a developer's real PRIVATE_TERMS."""
     monkeypatch.delenv("PRIVATE_TERMS", raising=False)
     monkeypatch.delenv("SCAN_PRIVATE_TERMS", raising=False)
+    monkeypatch.delenv("SCAN_CONFIG_DIR", raising=False)
+    from scanorganizer.vocabulary import clear_vocabulary_cache
+    clear_vocabulary_cache()
 
 
 @pytest.fixture(scope="session")

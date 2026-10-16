@@ -19,6 +19,11 @@ from functools import lru_cache
 from pathlib import Path
 from typing import FrozenSet, Iterable, Optional, Tuple
 
+from .config import (
+    clear_config_resolution_cache,
+    resolve_taxonomy_path,
+    resolve_vocabulary_path,
+)
 from .dates import date_from_text
 from .taxonomy import Taxonomy
 
@@ -104,14 +109,6 @@ _AMOUNT_RE = re.compile(
 )
 
 
-def _vocab_paths() -> Tuple[Path, ...]:
-    here = Path(__file__).resolve().parent.parent
-    return (
-        here / "config" / "outbound_vocabulary.txt",
-        Path("config/outbound_vocabulary.txt"),
-    )
-
-
 def _load_vocab_file(path: Path) -> Tuple[str, ...]:
     words: list[str] = []
     for raw in path.read_text(encoding="utf-8").splitlines():
@@ -124,17 +121,17 @@ def _load_vocab_file(path: Path) -> Tuple[str, ...]:
 
 @lru_cache(maxsize=1)
 def load_outbound_vocabulary() -> FrozenSet[str]:
-    """Return the committed generic vocabulary (lowercase, unique)."""
-    seen: set[str] = set()
-    for path in _vocab_paths():
-        try:
-            if path.exists():
-                for word in _load_vocab_file(path):
-                    if word:
-                        seen.add(word)
-                break
-        except OSError:
-            continue
+    """Return the committed generic vocabulary (lowercase, unique).
+
+    Fail-closed: a missing or empty vocabulary file raises ``RuntimeError``
+    so nothing is sent outbound without an allowlist.
+    """
+    path = resolve_vocabulary_path()
+    try:
+        words = _load_vocab_file(path)
+    except OSError as exc:
+        raise RuntimeError("outbound vocabulary file is missing or empty") from exc
+    seen = {word for word in words if word}
     if not seen:
         raise RuntimeError("outbound vocabulary file is missing or empty")
     return frozenset(seen)
@@ -165,8 +162,13 @@ def taxonomy_tokens(taxonomy: Optional[Taxonomy] = None) -> FrozenSet[str]:
 
 @lru_cache(maxsize=1)
 def _default_taxonomy() -> Taxonomy:
-    here = Path(__file__).resolve().parent.parent
-    return Taxonomy.load(here / "taxonomy.yaml")
+    return Taxonomy.load(resolve_taxonomy_path())
+
+
+def clear_vocabulary_cache() -> None:
+    load_outbound_vocabulary.cache_clear()
+    _default_taxonomy.cache_clear()
+    clear_config_resolution_cache()
 
 
 def allowed_outbound_tokens(taxonomy: Optional[Taxonomy] = None) -> FrozenSet[str]:
