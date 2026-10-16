@@ -35,10 +35,16 @@ reachable, plus:
 - Taxonomy lives in [`taxonomy.yaml`](taxonomy.yaml). Classification results are
   validated against it; anything invalid or low‑confidence lands in `_Review/`
   — never in a brand‑new folder.
-- Classifier choice: `--provider anthropic|gemini|local-keyword`.
-- A **local privacy filter** runs before any outbound call. On a sensitive match
-  the file is classified locally and no text leaves the host. Documents that
-  are sent out get SSNs, long account numbers, and DOBs scrubbed.
+- Classifier choice: `--provider anthropic|gemini|local-keyword`. The
+  Anthropic and Gemini defaults are deliberately older, cheap tiers
+  (`claude-3-haiku-20240307` and `gemini-2.0-flash`), never the newest
+  frontier models.
+- A **single local redaction gate** runs before any outbound call. It
+  guarantees that no children's PII — and no SSN, EIN, routing, account,
+  or card number — ever reaches a frontier model. Any private-term hit
+  short-circuits to the local classifier (`local-only: sensitive`).
+  Everything else is scrubbed, then a defensive re-scan inside each
+  provider call refuses to transmit anything that still looks like an ID.
 - JSONL manifest of every move + `--undo <manifest>` to reverse a batch.
 - Re‑file mode: `--refile <dir>` promotes files from legacy flat folders into
   the new taxonomy (dry‑run capable).
@@ -58,11 +64,25 @@ For each file in `--src`:
    (per manifests in `--log`), skip it as a duplicate.
 2. `.docx` and other review‑only formats go straight to `_Review/`.
 3. OCR up to `--ocr-pages` pages (default `5`). Empty text → `_Unsorted/`.
-4. The **privacy filter** matches the OCR text against your sensitive terms.
-   On a match, classify locally with keyword rules and send nothing out.
-5. Otherwise redact SSNs / long account numbers / DOBs, then call the chosen
+4. The **redaction gate** processes the OCR text:
+   * Private terms from `config/private_terms.txt` (whole-word,
+     case-insensitive, both `First Last` and `Last, First` orders) are
+     counted and replaced with `[REDACTED_TERM]`. Any hit flips the
+     document to `local-only: sensitive`.
+   * SSNs (`123-45-6789`, spaced, and 9-digit unformatted near SSN
+     keywords), EINs (`##-#######`), account/routing numbers (digit runs
+     of 8+ allowing spaces/dashes), payment cards (Luhn-valid 13–19 digit
+     runs tagged `[REDACTED_CARD]`), and labeled DOBs are scrubbed.
+   * The scrubbed text is re-scanned for residual PII shapes and for
+     topical signals (SSN / tax / medical / school keywords). A hit on
+     either keeps the document local.
+   * The gate reports counts only — never the matched values — so logs
+     and manifests never carry private strings.
+5. For non-sensitive documents, the scrubbed text is handed to the chosen
    `--provider` for a JSON classification:
    `{owner, area, doc_type, doc_date, confidence, short_name}`.
+   A defensive residual-PII check inside every provider call refuses to
+   transmit anything that still matches an ID pattern.
 6. The result is validated against `taxonomy.yaml`.
    - Not in the taxonomy → `_Review/`.
    - `confidence < confidence_threshold` (default 0.75) → `_Review/`.
@@ -140,9 +160,18 @@ Environment variables honored:
 
 - `SCANS_ROOT` — default for `--scans-root`.
 - `SCAN_PROVIDER` — default for `--provider`.
-- `SCAN_MODEL` — default for `--model`.
+- `SCAN_MODEL` — generic default for `--model` (applies to whichever
+  provider is active unless a provider‑specific override is also set).
+- `SCAN_ANTHROPIC_MODEL` — override for the Anthropic model.
+  Defaults to `claude-3-haiku-20240307` (older, cheap Haiku tier).
+- `SCAN_GEMINI_MODEL` — override for the Gemini model.
+  Defaults to `gemini-2.0-flash` (older, cheap Flash tier).
 - `ANTHROPIC_API_KEY` — required when `--provider anthropic`.
 - `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) — required when `--provider gemini`.
+
+Copy [`.env.example`](.env.example) to `.env` (git‑ignored) and fill the
+values in locally; or set these variables in
+`/etc/default/scan-organizer` for cron / systemd.
 
 ---
 
@@ -157,27 +186,51 @@ upgraded to use the new taxonomy.
 
 ## Privacy
 
-Create a local `private_terms.txt` (git‑ignored) from the committed example:
+Create a local `config/private_terms.txt` (git‑ignored) from the committed
+example:
 
 ```bash
-cp private_terms.example.txt private_terms.txt
-$EDITOR private_terms.txt
+mkdir -p config
+cp config/private_terms.example.txt config/private_terms.txt
+$EDITOR config/private_terms.txt
 ```
 
-Every line is a case‑insensitive term. Blank lines and `# comments` are
-ignored. Common minor/medical keywords (`school`, `pediatric`, `report card`,
-`immunization`, `DOB`, `IEP`, …) are built in and don't need to be repeated.
+Legacy `private_terms.txt` in the repo root is still honored for backward
+compatibility; the new `config/private_terms.txt` location takes
+precedence when both exist.
 
-**Guarantee:** when ANY of these terms appears in the OCR'd text, the external
-provider is never called for that document. It is classified locally with
-keyword rules and routed through the normal taxonomy / `_Review/` flow.
+Every line is a term. Matching is case‑insensitive with whole‑word
+boundaries. Two‑word names are automatically also matched in
+`Last, First` order. Blank lines and `# comments` are ignored. Common
+minor/medical keywords (`school`, `pediatric`, `report card`,
+`immunization`, `DOB`, `IEP`, …) are built in and don't need to be
+repeated.
 
-For everything else, the text sent to the provider is first scrubbed for:
+### Owner rule — enforced by code
 
-- US SSNs (`123-45-6789`)
-- Long account numbers (10+ consecutive digits, or 11–24 digits with spaces/
-  dashes between every digit — typical card formats)
-- Dates of birth labeled with `DOB`, `D.O.B.`, `date of birth`, or `born on …`
+* **No children's PII to any LLM.** Any private‑term hit, or two or more
+  hits against the built‑in topical signal list
+  (SSN / tax / medical / school‑record keywords), causes the document to
+  be classified locally and recorded in the manifest as
+  `local-only: sensitive`. Zero provider calls are made.
+* **No SSN, EIN, routing, account, or card number to any frontier model.**
+  Documents that *are* sent to the provider first go through the single
+  redaction gate, which scrubs:
+  * US SSNs — `123-45-6789`, `123 45 6789`, and unformatted
+    9‑digit values when they sit next to an SSN / TIN / ITIN cue.
+  * EINs — `##-#######`.
+  * Account/routing numbers — any digit run of 8+, including runs
+    separated by spaces or dashes (groups of 3+ digits).
+  * Payment cards — Luhn‑valid 13–19 digit sequences, tagged as
+    `[REDACTED_CARD]`.
+  * Dates of birth labeled with `DOB`, `D.O.B.`, `date of birth`,
+    `birthdate`, `birthday`, or `born on …`.
+* **Nothing sensitive is ever logged.** The gate reports counts and
+  category labels only — never the matched substring or term.
+
+A defensive residual‑PII check inside every provider call re‑scans the
+final prompt immediately before it goes on the wire and refuses to
+transmit anything that still matches an ID pattern.
 
 ---
 
@@ -201,8 +254,8 @@ For everything else, the text sent to the provider is first scrubbed for:
 
    ```bash
    sudo mkdir -p /opt/scan-organizer/config
-   sudo cp taxonomy.yaml                 /opt/scan-organizer/config/
-   sudo cp private_terms.example.txt     /opt/scan-organizer/config/private_terms.txt
+   sudo cp taxonomy.yaml                        /opt/scan-organizer/config/
+   sudo cp config/private_terms.example.txt     /opt/scan-organizer/config/private_terms.txt
    sudo $EDITOR /opt/scan-organizer/config/private_terms.txt
    ```
 
@@ -327,9 +380,17 @@ The test suite covers:
 - `tests/test_classification.py` — local keyword classifier over representative
   OCR samples, plus the fallback path when a remote provider's env var is
   missing.
-- `tests/test_privacy.py` — sensitive term matching with built‑in and user‑
-  loaded terms, outbound gating decision.
-- `tests/test_redaction.py` — SSN / long account number / DOB redaction.
+- `tests/test_privacy.py` — private‑term matching, `Last, First` variant,
+  whole‑word boundary, outbound gating and count‑only reporting.
+- `tests/test_redaction.py` — redaction of each category (SSN dashed /
+  spaced / near-keyword, EIN, long account digits, Luhn-valid card,
+  spaced/dashed routing, DOB variants), Luhn checksum, and the
+  `assert_safe_for_outbound` defensive guard.
+- `tests/test_outbound_privacy.py` — Anthropic and Gemini providers are
+  mocked and the test asserts that no SSN, EIN, account, card, DOB, or
+  private‑term value ever appears in the outbound prompt, logs, or
+  manifest. Also exercises the `local-only: sensitive` short‑circuit for
+  private‑term hits and the topic‑density fallback.
 - `tests/test_undo.py` — end‑to‑end round trip: seed an inbox, process, undo,
   verify everything is back where it started, plus the duplicate‑skip path.
 - `tests/test_dry_run.py` — dry‑run writes a manifest but moves nothing,
