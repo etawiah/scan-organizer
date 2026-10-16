@@ -35,10 +35,23 @@ reachable, plus:
 - Taxonomy lives in [`taxonomy.yaml`](taxonomy.yaml). Classification results are
   validated against it; anything invalid or low‑confidence lands in `_Review/`
   — never in a brand‑new folder.
-- Classifier choice: `--provider anthropic|gemini|local-keyword`. The
-  Anthropic and Gemini defaults are deliberately cheap hosted tiers
+- Classifier choice: `--provider anthropic|gemini|local-keyword|ollama`.
+  The Anthropic and Gemini defaults are deliberately cheap hosted tiers
   (`claude-3-haiku-20240307` and `gemini-2.5-flash-lite`). Gemini 2.0
-  Flash shut down in June 2026.
+  Flash shut down in June 2026. Keyword-only Gemini is a poor fit for
+  this corpus, so `--provider ollama` talks to a **local** model on
+  the LAN (`SCAN_PROVIDER=ollama`, `OLLAMA_URL` default
+  `http://localhost:11434`, deploy on `192.168.3.x`,
+  `OLLAMA_MODEL` default `qwen2.5:7b-instruct`, `OLLAMA_TIMEOUT`
+  default 180s / minimum 120s). The host handles **one request at a
+  time**; calls are serialized and the OCR text sent per file is
+  capped at about 2500 tokens (~10k characters). Ollama is marked
+  `is_local=True`: it receives the redacted-by-private-terms OCR (not
+  the cloud allowlist) and does not count against `--max-cloud-calls`.
+  `OLLAMA_URL` is refused unless the host is `localhost` or an
+  RFC1918/LAN address, so a mis-set URL cannot leak to a remote host.
+  Private-term hits and kids' / `LOCAL_ONLY_CATEGORIES` routing still
+  short-circuit to `local-keyword` exactly as before.
 - A **single local redaction gate** runs before any outbound call. It
   guarantees that no children's PII — and no SSN, EIN, routing, account,
   or card number — ever reaches a frontier model. Any private-term hit
@@ -63,6 +76,17 @@ reachable, plus:
   request, including retries, and sends remaining outbound files to
   `_Review/` when the cap is reached. `--no-retry` /
   `SCAN_GEMINI_RETRIES` (default 3) controls Gemini 429/503 retries.
+  Local Ollama calls are not counted.
+- Every model answer is **normalized** (trim, drop blank path
+  segments, collapse consecutive repeats, case-insensitive match)
+  against `taxonomy.yaml`. Empty, malformed (`A//A/B`,
+  `Finance/Finance`), or below-threshold paths go to `_Review/` and
+  are never filed — for every provider.
+- OCR retries a low-confidence or low word-hit-rate page with a
+  horizontal flip and a 180° rotation, and keeps the best text
+  (mirrored / flipped ADF scans).
+- Per-file runtime is logged and the average is printed on the
+  console and in `summary-<UTC timestamp>.md`.
 - `--provider-probe` sends a content-free `ping` and prints HTTP status.
 - `Dockerfile`, `docker-compose.yml`, cron + systemd‑timer samples.
 - `test_api_key.py` no longer prints any portion of the API key (supersedes
@@ -77,7 +101,10 @@ For each file in `--src`:
 1. Compute `sha256`. If we've already filed a file with this hash
    (per manifests in `--log`), skip it as a duplicate.
 2. `.docx` and other review‑only formats go straight to `_Review/`.
-3. OCR up to `--ocr-pages` pages (default `5`). Empty text → `_Unsorted/`.
+3. OCR up to `--ocr-pages` pages (default `5`). If Tesseract
+   confidence or the word-hit rate is low, the same page is retried
+   horizontally flipped and rotated 180°, and the best text is kept.
+   Empty text → `_Unsorted/`.
 4. The **redaction gate** processes the OCR text:
    * Private terms from `config/private_terms.txt` or `PRIVATE_TERMS`
      (whole-word, case-insensitive including ALL CAPS, `First Last` /
@@ -104,17 +131,24 @@ For each file in `--src`:
      either keeps the document local.
    * The gate reports counts only — never the matched values — so logs
      and manifests never carry private strings.
-5. For non-sensitive documents the provider sees an **allowlist prompt**
-   only: taxonomy-category names, keywords from the committed generic
-   vocabulary (`config/outbound_vocabulary.txt`) that appear in the
-   document, and coarse features (page bucket, has-dates, has-amounts).
-   OCR text, filenames, paths, numbers, names, emails, and addresses
-   never leave the host. `assert_safe_for_outbound` requires every
-   token to be in that vocabulary or the taxonomy. Documents whose
-   local keyword pre-pass is `Finance-Bank`, `ID-Legal`, or `Medical`
-   stay local-only; override with `LOCAL_ONLY_CATEGORIES`.
-6. The result is validated against `taxonomy.yaml`.
-   - Not in the taxonomy → `_Review/`.
+5. For non-sensitive documents a **cloud** provider sees an
+   **allowlist prompt** only: taxonomy-category names, keywords from
+   the committed generic vocabulary (`config/outbound_vocabulary.txt`)
+   that appear in the document, and coarse features (page bucket,
+   has-dates, has-amounts). OCR text, filenames, paths, numbers,
+   names, emails, and addresses never leave the host.
+   `assert_safe_for_outbound` requires every token to be in that
+   vocabulary or the taxonomy. Documents whose local keyword pre-pass
+   is `Finance-Bank`, `ID-Legal`, or `Medical` stay local-only;
+   override with `LOCAL_ONLY_CATEGORIES`. The **ollama** provider is
+   local (`is_local=True`) so the allowlist gate does not apply: it
+   receives the redacted-by-private-terms OCR, capped at ~2500 tokens
+   (~10k characters), one file at a time. Private-term and kids'
+   local-only routing is unchanged.
+6. The result is validated against `taxonomy.yaml` after the path is
+   normalized (trim, collapse blank or repeated segments,
+   case-insensitive).
+   - Not in the taxonomy, empty, or malformed → `_Review/`, never filed.
    - `confidence < confidence_threshold` (default 0.75) → `_Review/`.
 7. Final document date = latest plausible date in the text,
    else the `MMDDYYYY` embedded in a Brother‑style scanner filename
@@ -172,7 +206,7 @@ Behavior:
 
 | Flag | Purpose |
 | --- | --- |
-| `--provider {anthropic,gemini,local-keyword}` | Classifier. Default: `$SCAN_PROVIDER` or `local-keyword`. |
+| `--provider {anthropic,gemini,local-keyword,ollama}` | Classifier. Default: `$SCAN_PROVIDER` or `local-keyword`. |
 | `--model NAME` | Model override for the chosen provider. |
 | `--confidence-threshold FLOAT` | Overrides the YAML threshold. |
 | `--ocr-pages N` | PDF pages to OCR. Default `5`. |
@@ -213,6 +247,14 @@ Environment variables honored:
   attempt (default 3). `0` is the same as `--no-retry`.
 - `ANTHROPIC_API_KEY` — required when `--provider anthropic`.
 - `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) — required when `--provider gemini`.
+- `OLLAMA_URL` — Ollama base URL (default `http://localhost:11434`).
+  Host must be `localhost` or an RFC1918/LAN address (the live
+  daemon is on `192.168.3.x`); anything else is refused. Example in
+  [`.env.example`](.env.example): `http://192.168.x.x:11434`.
+- `OLLAMA_MODEL` — Ollama model id (default `qwen2.5:7b-instruct`).
+- `OLLAMA_TIMEOUT` — seconds (default `180`, minimum `120`). The
+  model handles one request at a time; OCR text is capped at ~2500
+  tokens (~10k characters) per file.
 
 Copy [`.env.example`](.env.example) to `.env` (git‑ignored) and fill the
 values in locally; or set these variables in
@@ -477,7 +519,14 @@ The test suite covers:
   invoking OCR or any provider, and `#recycle` / `@eaDir` / `.DS_Store` are
   skipped.
 - `tests/test_dates.py` — document date resolution precedence.
-- `tests/test_taxonomy.py` — YAML schema and node validation.
+- `tests/test_taxonomy.py` — YAML schema, node validation, and path
+  normalization (`A//A/B`, empty, `Finance/Finance` → `_Review/`).
+- `tests/test_ollama.py` — local provider, full redacted OCR,
+  RFC1918/localhost URL guard, private-term / kids local-only still
+  short-circuit.
+- `tests/test_ocr.py` — mirrored/flipped synthetic image keeps the
+  best orientation.
+- `tests/test_runtime.py` — per-file elapsed time and summary average.
 
 Tests use a monkey‑patched OCR shim so they run without Tesseract or Poppler.
 

@@ -16,8 +16,11 @@ def summarize(entries: Iterable[ManifestEntry]) -> dict:
     unsorted_: List[str] = []
     errors: List[str] = []
     providers: Counter[str] = Counter()
+    elapsed: List[float] = []
 
     for entry in entries:
+        if getattr(entry, "elapsed_s", 0):
+            elapsed.append(float(entry.elapsed_s))
         if entry.dry_run:
             continue
         counts[entry.action] += 1
@@ -40,6 +43,8 @@ def summarize(entries: Iterable[ManifestEntry]) -> dict:
         "unsorted": unsorted_,
         "errors": errors,
         "providers": providers,
+        "avg_elapsed_s": (sum(elapsed) / len(elapsed)) if elapsed else None,
+        "timed_files": len(elapsed),
     }
 
 
@@ -61,6 +66,14 @@ def write_summary(summary: dict, out_path: Path, when: date | None = None) -> Pa
     lines.append(f"- Errors: **{counts.get('error', 0)}**")
     lines.append(f"- Grand total moves this period: **{total_moved}**")
     lines.append("")
+
+    timed = summary.get("timed_files") or 0
+    avg = summary.get("avg_elapsed_s")
+    if timed and avg is not None:
+        lines.append("## Runtime")
+        lines.append("")
+        lines.append(f"- Average per-file: **{avg:.3f}s** ({timed} file{'s' if timed != 1 else ''})")
+        lines.append("")
 
     providers = summary.get("providers", Counter())
     if providers:

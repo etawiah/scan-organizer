@@ -21,15 +21,18 @@ bypasses the ``privacy.gate`` entry point in future code.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Dict, Optional
+from urllib.parse import urlparse
 
 from . import local_rules
 from .privacy import SensitiveTerms, assert_safe_for_outbound
@@ -47,6 +50,33 @@ log = logging.getLogger(__name__)
 # Override with GEMINI_MODEL (or SCAN_GEMINI_MODEL / SCAN_MODEL / --model).
 DEFAULT_ANTHROPIC_MODEL = "claude-3-haiku-20240307"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_OLLAMA_URL = "http://localhost:11434"
+# Deployment: LAN 192.168.3.x runs qwen2.5:7b-instruct, one request at a time.
+DEFAULT_OLLAMA_MODEL = "qwen2.5:7b-instruct"
+DEFAULT_OLLAMA_TIMEOUT_S = 180
+MIN_OLLAMA_TIMEOUT_S = 120
+# ~2500 tokens ≈ 4 chars/token. Head of the page is kept (letterhead / title).
+OLLAMA_OCR_TOKEN_CAP = 2500
+OLLAMA_OCR_CHAR_CAP = 10_000
+
+_OLLAMA_LOCK = threading.Lock()
+
+# Literal hosts plus an explicit LAN allowlist. Remote hostnames are
+# refused so a mis-set OLLAMA_URL cannot leak redacted OCR off the LAN.
+# IPv4: loopback + RFC1918. IPv6: ::1 and ULA (fc00::/7) only.
+# IPv4-mapped / IPv4-compatible IPv6 is converted and rechecked as IPv4.
+# Unspecified addresses (::, 0.0.0.0) are always refused.
+_ALLOWED_V4_NETWORKS = (
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
+_IPV6_LOOPBACK = ipaddress.ip_address("::1")
+_IPV6_ULA = ipaddress.ip_network("fc00::/7")
+_UNSPECIFIED_V4 = ipaddress.ip_address("0.0.0.0")
+_UNSPECIFIED_V6 = ipaddress.ip_address("::")
+_LOCALHOST_NAMES = frozenset({"localhost", "localhost.localdomain"})
 
 # Retry transient Gemini capacity / rate-limit failures. "Up to 3 times"
 # means 3 retries after the first failure (4 attempts total). Override
@@ -62,6 +92,10 @@ class ProviderError(RuntimeError):
 
 class CloudCallCapError(ProviderError):
     """Raised when ``--max-cloud-calls`` / ``SCAN_MAX_CLOUD_CALLS`` is exhausted."""
+
+
+class OllamaURLError(ProviderError):
+    """Raised when ``OLLAMA_URL`` is not localhost or an RFC1918/LAN address."""
 
 
 @dataclass
@@ -159,6 +193,128 @@ rather than guessing the caller will route low confidence documents for human re
 """
 
 
+def cap_ollama_ocr_text(text: str, limit: int = OLLAMA_OCR_CHAR_CAP) -> str:
+    """Keep at most ``limit`` characters (~2500 tokens) of redacted OCR."""
+    body = text if text is not None else ""
+    if limit <= 0:
+        return ""
+    if len(body) <= limit:
+        return body
+    return body[:limit]
+
+
+def _build_local_prompt(taxonomy: Taxonomy, scrubbed_ocr: str) -> str:
+    """Full-text prompt for a local model. Uses already-redacted OCR."""
+    allowed = taxonomy.describe_for_prompt()
+    body = cap_ollama_ocr_text(scrubbed_ocr if scrubbed_ocr is not None else "")
+    return f"""You are classifying scanned household business documents into a strict taxonomy.
+
+ALLOWED taxonomy nodes owner area doc_type. You must pick EXACTLY one.
+Use empty string for area when the node has no area segment.
+
+{allowed}
+
+Return ONLY a JSON object with these keys nothing else
+  owner string must be one of the owners above
+  area string empty if the owner has no area segment
+  doc_type string must match the owner area pair
+  doc_date string empty if unknown
+  confidence float reflecting how sure you are about owner area doc_type
+  short_name short descriptive name lowercase words underscores no file extension no PII
+
+If you cannot confidently place the document in any node set confidence low
+rather than guessing the caller will route low confidence documents for human review.
+
+The document text below has already had private terms redacted. Classify it.
+
+---
+{body}
+---
+"""
+
+
+def _ipv4_from_mapped_or_compat(ip: ipaddress.IPv6Address) -> Optional[ipaddress.IPv4Address]:
+    """Return the embedded IPv4 address for mapped (::ffff:) or compat (::) form."""
+    mapped = ip.ipv4_mapped
+    if mapped is not None:
+        return mapped
+    # IPv4-compatible ::a.b.c.d (96-bit zero prefix). :: and ::1 are
+    # handled by the caller before this conversion.
+    packed = ip.packed
+    if packed[:12] == b"\x00" * 12:
+        return ipaddress.IPv4Address(packed[12:])
+    return None
+
+
+def _is_allowed_ipv4(ip: ipaddress.IPv4Address) -> bool:
+    if ip == _UNSPECIFIED_V4:
+        return False
+    return any(ip in network for network in _ALLOWED_V4_NETWORKS)
+
+
+def _is_allowed_ollama_host(host: str) -> bool:
+    """True only for localhost, IPv4 loopback/RFC1918, ::1, or fc00::/7."""
+    name = (host or "").strip().lower().rstrip(".")
+    if name.startswith("[") and name.endswith("]"):
+        name = name[1:-1]
+    if not name:
+        return False
+    if name in _LOCALHOST_NAMES:
+        return True
+    try:
+        ip = ipaddress.ip_address(name)
+    except ValueError:
+        return False
+    if ip.version == 6:
+        if ip == _UNSPECIFIED_V6:
+            return False
+        if ip == _IPV6_LOOPBACK or ip in _IPV6_ULA:
+            return True
+        embedded = _ipv4_from_mapped_or_compat(ip)
+        if embedded is not None:
+            return _is_allowed_ipv4(embedded)
+        return False
+    return _is_allowed_ipv4(ip)
+
+
+def validate_ollama_url(url: str) -> str:
+    """Return a cleaned Ollama base URL, or raise :class:`OllamaURLError`.
+
+    Only ``http``/``https`` URLs whose host is ``localhost``, loopback, or
+    an RFC1918/LAN address are accepted. Hostnames that are not
+    ``localhost`` are refused without DNS lookup so a remote name cannot
+    be used to leak document text.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        raise OllamaURLError("OLLAMA_URL is empty")
+    parsed = urlparse(raw)
+    if parsed.scheme not in {"http", "https"}:
+        raise OllamaURLError(
+            f"OLLAMA_URL scheme must be http or https, got {parsed.scheme!r}"
+        )
+    host = parsed.hostname
+    if not host:
+        raise OllamaURLError("OLLAMA_URL is missing a host")
+    if parsed.username or parsed.password:
+        raise OllamaURLError("OLLAMA_URL must not include userinfo")
+    if not _is_allowed_ollama_host(host):
+        raise OllamaURLError(
+            f"OLLAMA_URL host {host!r} is not localhost or an RFC1918/LAN address"
+        )
+    # Rebuild without a trailing path so callers can append /api/chat.
+    netloc = parsed.netloc
+    cleaned = f"{parsed.scheme}://{netloc}"
+    return cleaned.rstrip("/")
+
+
+def resolve_ollama_url(explicit: Optional[str] = None) -> str:
+    raw = explicit if explicit is not None else os.environ.get("OLLAMA_URL")
+    if raw is None or str(raw).strip() == "":
+        raw = DEFAULT_OLLAMA_URL
+    return validate_ollama_url(str(raw))
+
+
 @dataclass
 class ClassifierSettings:
     provider: str
@@ -168,6 +324,8 @@ class ClassifierSettings:
     gemini_retries: Optional[int] = None
     no_retry: bool = False
     cloud_budget: Optional[CloudCallBudget] = None
+    ollama_url: Optional[str] = None
+    ollama_timeout_s: Optional[int] = None
 
 
 def _resolve_anthropic_model(settings: ClassifierSettings) -> str:
@@ -212,6 +370,99 @@ def _resolve_gemini_model(settings: ClassifierSettings) -> str:
         or os.environ.get("SCAN_MODEL")
         or DEFAULT_GEMINI_MODEL
     )
+
+
+def _resolve_ollama_model(settings: ClassifierSettings) -> str:
+    return (
+        settings.model
+        or os.environ.get("OLLAMA_MODEL")
+        or os.environ.get("SCAN_MODEL")
+        or DEFAULT_OLLAMA_MODEL
+    )
+
+
+def _resolve_ollama_timeout(settings: ClassifierSettings) -> int:
+    """Seconds. Floor is 120; default is 180 (qwen2.5:7b is one-at-a-time)."""
+    resolved: Optional[int] = None
+    if settings.ollama_timeout_s is not None:
+        resolved = max(1, int(settings.ollama_timeout_s))
+    else:
+        raw = os.environ.get("OLLAMA_TIMEOUT")
+        if raw is not None and str(raw).strip() != "":
+            try:
+                resolved = max(1, int(str(raw).strip()))
+            except ValueError:
+                resolved = DEFAULT_OLLAMA_TIMEOUT_S
+    if resolved is None:
+        resolved = DEFAULT_OLLAMA_TIMEOUT_S
+    return max(MIN_OLLAMA_TIMEOUT_S, resolved)
+
+
+def _ollama_post(url: str, body: Dict[str, object], timeout: int) -> Dict[str, object]:
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    # Local: do not count against the cloud-call budget and do not run
+    # assert_safe_for_outbound (the prompt is the full redacted OCR).
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _call_ollama(prompt: str, settings: ClassifierSettings) -> str:
+    """Call a LAN Ollama daemon. Tries ``/api/chat`` then ``/api/generate``.
+
+    The host model handles one request at a time, so every call takes a
+    process-wide lock and the batch loop never overlaps requests.
+    """
+    with _OLLAMA_LOCK:
+        return _call_ollama_locked(prompt, settings)
+
+
+def _call_ollama_locked(prompt: str, settings: ClassifierSettings) -> str:
+    base = resolve_ollama_url(settings.ollama_url)
+    model = _resolve_ollama_model(settings)
+    timeout = _resolve_ollama_timeout(settings)
+    chat_body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "format": "json",
+    }
+    try:
+        result = _ollama_post(f"{base}/api/chat", chat_body, timeout)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise ProviderError(f"Ollama HTTP {exc.code}") from exc
+        log.info("Ollama /api/chat returned 404; trying /api/generate")
+        result = None
+    except Exception as exc:
+        raise ProviderError(f"Ollama call failed: {exc}") from exc
+    else:
+        try:
+            return result["message"]["content"]
+        except (KeyError, TypeError) as exc:
+            raise ProviderError("Unexpected Ollama /api/chat payload shape") from exc
+
+    generate_body = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "format": "json",
+    }
+    try:
+        result = _ollama_post(f"{base}/api/generate", generate_body, timeout)
+        return result["response"]
+    except urllib.error.HTTPError as exc:
+        raise ProviderError(f"Ollama HTTP {exc.code}") from exc
+    except (KeyError, TypeError) as exc:
+        raise ProviderError("Unexpected Ollama /api/generate payload shape") from exc
+    except ProviderError:
+        raise
+    except Exception as exc:
+        raise ProviderError(f"Ollama call failed: {exc}") from exc
 
 
 def _read_http_error_body(exc: urllib.error.HTTPError) -> str:
@@ -349,6 +600,10 @@ def provider_probe(settings: ClassifierSettings) -> Dict[str, object]:
                 "status": 0,
                 "detail": "local-keyword makes no network calls",
             }
+        if settings.provider == "ollama":
+            model = _resolve_ollama_model(settings)
+            _call_ollama(ping, settings)
+            return {"ok": True, "provider": "ollama", "model": model, "status": 200}
         if settings.provider == "gemini":
             model = _resolve_gemini_model(settings)
             _call_gemini(ping, settings)
@@ -400,15 +655,19 @@ def classify(
     settings: ClassifierSettings,
     terms: Optional[SensitiveTerms] = None,
     file_path: str = "",
+    local_ocr_text: Optional[str] = None,
 ) -> Dict[str, object]:
     """Dispatch to the configured provider.
 
     ``text`` is expected to already have passed through
-    :func:`scanorganizer.privacy.gate`. The outbound prompt is built from
-    allowlisted signals only — OCR text, filenames, and paths are never
-    interpolated. A private-term hit on the filename or path keeps the
-    document local-only. A defensive token-allowlist check inside each
-    remote call ensures a forgetful caller still cannot leak leftovers.
+    :func:`scanorganizer.privacy.gate`. Cloud providers get an allowlist
+    prompt — OCR text, filenames, and paths are never interpolated. The
+    local ``ollama`` provider is marked ``is_local`` and receives the
+    full redacted-by-private-terms OCR (``local_ocr_text`` or ``text``);
+    the outbound allowlist and cloud-call budget do not apply. A
+    private-term hit on the filename or path still keeps the document
+    local-only. A defensive token-allowlist check inside each remote
+    call ensures a forgetful caller still cannot leak leftovers.
 
     Falls back to the local keyword classifier if a remote provider fails.
     """
@@ -423,6 +682,29 @@ def classify(
         result["privacy"] = "local-only: sensitive"
         result["privacy_blocked"] = True
         return result
+
+    if settings.provider == "ollama":
+        prompt = _build_local_prompt(
+            taxonomy,
+            local_ocr_text if local_ocr_text is not None else text,
+        )
+        try:
+            raw = _call_ollama(prompt, settings)
+            parsed = _coerce(_extract_json(raw))
+            parsed["provider"] = "ollama"
+            parsed["is_local"] = True
+            return parsed
+        except Exception as exc:
+            log.warning(
+                "Classifier provider %s failed, falling back to local-keyword: %s",
+                settings.provider,
+                type(exc).__name__,
+            )
+            fallback = local_rules.classify(text, taxonomy, filename)
+            fallback["provider"] = "local-keyword"
+            fallback["fallback_from"] = settings.provider
+            fallback["fallback_reason"] = type(exc).__name__
+            return fallback
 
     if settings.cloud_budget is not None and settings.cloud_budget.exhausted():
         return cloud_cap_result(settings.provider)
