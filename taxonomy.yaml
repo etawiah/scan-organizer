@@ -1,0 +1,90 @@
+# Scan Organizer taxonomy.
+#
+# Shape:
+#   tree:
+#     <owner>:
+#       <area>:            # use "" (empty string) for owners that have no area layer
+#         - <doc_type>
+#         - <doc_type>
+#
+# Reserved folders (_Review and _Unsorted) are created automatically alongside
+# the taxonomy and never need to be listed here.
+#
+# The AI classifier must return owner / area / doc_type values that already
+# exist in this tree. Anything that does not validate — or that falls below the
+# configured confidence threshold — is routed to _Review/ instead.
+
+confidence_threshold: 0.75
+
+review_folder: _Review
+unsorted_folder: _Unsorted
+
+tree:
+  Business:
+    ComplexTech:
+      - Invoices-Out
+      - Bills-In
+      - Contracts
+      - Tax
+      - Payroll
+      - Bank
+      - Licenses-Insurance
+    ElJetSit:
+      - Invoices
+      - Bills
+      - Contracts
+      - Tax
+      - Bank
+      - Corporate
+    432SouthStVT:
+      - Lease-Tenants
+      - Mortgage-Bank
+      - PropertyTax
+      - Insurance
+      - Repairs-Receipts
+      - Utilities
+
+  Campaign:
+    BRKidsFirst:
+      - Donations-Receipts
+      - Expenses
+      - Filings-Compliance
+      - Correspondence
+
+  Personal:
+    "":
+      - Taxes
+      - Finance-Bank
+      - Medical
+      - Insurance
+      - ID-Legal
+      - Correspondence
+      - Receipts
+
+  Family:
+    Spouse:
+      - Medical
+      - ID-Legal
+      - Correspondence
+    Kids:
+      - School
+      - Medical
+      - Activities
+      - ID
+    Mother:
+      - Medical
+      - Finance
+      - Legal
+      - Correspondence
+
+  Household:
+    Home:
+      - Utilities
+      - Mortgage-Rent
+      - Repairs
+      - Warranties
+    Vehicles:
+      - Registration
+      - Insurance
+      - Service
+      - Loan
