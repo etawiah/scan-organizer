@@ -19,6 +19,13 @@ from scanorganizer.taxonomy import Taxonomy  # noqa: E402
 TAXONOMY_PATH = ROOT / "taxonomy.yaml"
 
 
+@pytest.fixture(autouse=True)
+def _clear_private_terms_env(monkeypatch):
+    """Tests must never pick up a developer's real PRIVATE_TERMS."""
+    monkeypatch.delenv("PRIVATE_TERMS", raising=False)
+    monkeypatch.delenv("SCAN_PRIVATE_TERMS", raising=False)
+
+
 @pytest.fixture(scope="session")
 def taxonomy() -> Taxonomy:
     return Taxonomy.load(TAXONOMY_PATH)

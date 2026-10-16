@@ -3,8 +3,10 @@
 # Copy this file to `config/private_terms.txt` (which is .gitignored) and
 # replace the placeholders below with the real names, schools, and keywords
 # you want the redaction gate to catch. Entries are matched case-insensitive
-# with whole-word boundaries, and two-word names are automatically also
-# matched in `Last, First` order.
+# (including ALL CAPS) with whole-word boundaries. `_` and `-` count as
+# boundaries so names in filenames/paths match. Two-word names are also
+# matched in `Last, First` order and as the lone given name. You can
+# instead set PRIVATE_TERMS in the environment — never commit real names.
 #
 # When ANY term in this file matches the OCR'd text of a document,
 # scan-organizer:

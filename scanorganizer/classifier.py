@@ -40,11 +40,12 @@ log = logging.getLogger(__name__)
 
 # Owner rule: never default to the newest, most expensive frontier tier.
 # Anthropic: the original Haiku 3 is the cheapest hosted tier and never
-# auto-upgrades. Gemini 2.0 Flash was shut down on 2026-06-01, so the
-# cheapest Flash tier still served is 2.5 Flash. Override with GEMINI_MODEL
-# (or SCAN_GEMINI_MODEL / SCAN_MODEL / --model).
+# auto-upgrades. Gemini 2.0 Flash and 2.0 Flash-Lite shut down 2026-06-01.
+# The oldest cheap Flash still listed as live is gemini-2.5-flash-lite
+# (Google: "fastest and most budget-friendly" 2.5 multimodal model).
+# Override with GEMINI_MODEL (or SCAN_GEMINI_MODEL / SCAN_MODEL / --model).
 DEFAULT_ANTHROPIC_MODEL = "claude-3-haiku-20240307"
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 # Retry transient Gemini capacity / rate-limit failures. "Up to 3 times"
 # means 3 retries after the first failure (4 attempts total).

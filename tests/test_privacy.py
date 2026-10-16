@@ -5,7 +5,14 @@ person's PII should ever appear in a test fixture.
 """
 from __future__ import annotations
 
-from scanorganizer.privacy import SensitiveTerms, evaluate, gate
+import pytest
+
+from scanorganizer.privacy import (
+    SensitiveTerms,
+    assert_safe_for_outbound,
+    evaluate,
+    gate,
+)
 
 
 def test_builtin_terms_match_minor_keywords():
@@ -133,5 +140,68 @@ def test_count_hits_is_count_only():
         extra_terms=["Jane Fictional"],
         include_builtins=False,
     )
-    assert terms.count_hits("Jane Fictional met Fictional, Jane.") == 2
+    assert terms.count_hits("Jane Fictional met Fictional, Jane.") >= 2
     assert terms.count_hits("Nothing to see here.") == 0
+
+
+def test_lone_given_name_matches_any_case():
+    terms = SensitiveTerms.load(
+        path=None, extra_terms=["Zebulon"], include_builtins=False,
+    )
+    for raw in ("ZEBULON", "zebulon", "Zebulon"):
+        assert terms.contains_sensitive(raw), raw
+        assert terms.contains_user_term(raw), raw
+        scrubbed, hits = terms.redact(f"Payment from {raw} posted.")
+        assert hits >= 1
+        assert "zebulon" not in scrubbed.lower()
+        assert "[REDACTED_TERM]" in scrubbed
+        with pytest.raises(ValueError, match="private term"):
+            assert_safe_for_outbound(raw, terms)
+        with pytest.raises(ValueError, match="private term"):
+            assert_safe_for_outbound(f"memo {raw} only", terms)
+
+
+def test_full_name_also_blocks_lone_given_name():
+    terms = SensitiveTerms.load(
+        path=None, extra_terms=["Zebulon Quill"], include_builtins=False,
+    )
+    assert terms.contains_sensitive("ZEBULON")
+    assert terms.contains_sensitive("zebulon")
+    assert terms.contains_user_term("ZEBULON")
+    scrubbed, _ = terms.redact("Filed for ZEBULON today.")
+    assert "ZEBULON" not in scrubbed
+    with pytest.raises(ValueError, match="private term"):
+        assert_safe_for_outbound("ZEBULON", terms)
+
+
+def test_lone_given_name_in_filename_and_path():
+    terms = SensitiveTerms.load(
+        path=None, extra_terms=["Zebulon"], include_builtins=False,
+    )
+    assert terms.contains_sensitive("ZEBULON_scan.pdf")
+    assert terms.contains_sensitive("zebulon-notes.tiff")
+    assert terms.contains_sensitive("/scans/ZEBULON/bill.pdf")
+    assert terms.contains_user_term("/inbox/zebulon/file.pdf")
+    scrubbed, _ = terms.redact("/scans/ZEBULON/bill.pdf")
+    assert "ZEBULON" not in scrubbed
+    with pytest.raises(ValueError, match="private term"):
+        assert_safe_for_outbound("Original filename: ZEBULON_scan.pdf", terms)
+
+
+def test_private_terms_env_var(monkeypatch, tmp_path):
+    monkeypatch.setenv("PRIVATE_TERMS", "Zebulon, Marta Quill")
+    terms = SensitiveTerms.load(path=None, include_builtins=False)
+    assert terms.contains_user_term("ZEBULON")
+    assert terms.contains_user_term("zebulon")
+    assert terms.contains_user_term("Marta")
+    f = tmp_path / "private_terms.txt"
+    f.write_text("Zebulon\n", encoding="utf-8")
+    from_file = SensitiveTerms.load(path=f, include_builtins=False, include_env=False)
+    assert from_file.contains_sensitive("ZEBULON")
+    assert not from_file.contains_sensitive("Marta")
+
+
+def test_builtin_phrases_do_not_expand_to_lone_first_token():
+    terms = SensitiveTerms.load(path=None, include_builtins=True, include_env=False)
+    # "report card" must not start matching the word "report" alone.
+    assert not terms.contains_sensitive("Status report attached to the invoice.")

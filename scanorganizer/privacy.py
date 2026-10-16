@@ -21,6 +21,7 @@ the local classifier.
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -118,6 +119,63 @@ def _expand_name_variants(term: str) -> List[str]:
     return variants
 
 
+def _given_name_tokens(term: str) -> List[str]:
+    """Lone given-name token from a user private term.
+
+    ``"Zebulon Quill"`` → ``["Zebulon"]``. ``"Quill, Zebulon"`` →
+    ``["Zebulon"]``. A single-token term is already matched as itself.
+    Built-in topical phrases must NOT go through this helper.
+    """
+    cleaned = term.strip()
+    if not cleaned or any(c in cleaned for c in "/\\"):
+        return []
+    if "," in cleaned:
+        bits = [p.strip() for p in cleaned.split(",") if p.strip()]
+        if len(bits) >= 2:
+            first = bits[1].split()[0] if bits[1].split() else ""
+            return [first] if first else []
+        return []
+    parts = cleaned.split()
+    if len(parts) >= 2:
+        return [parts[0]]
+    return []
+
+
+def _terms_from_env() -> List[str]:
+    """Load user private terms from ``PRIVATE_TERMS`` / ``SCAN_PRIVATE_TERMS``.
+
+    Comma or newline separated. Never log the values. The repo is public,
+    so this is the other supported way to supply names without committing
+    them (alongside the gitignored ``private_terms.txt``).
+    """
+    raw = os.environ.get("PRIVATE_TERMS") or os.environ.get("SCAN_PRIVATE_TERMS") or ""
+    if not raw.strip():
+        return []
+    items: List[str] = []
+    for chunk in raw.replace("\n", ",").split(","):
+        token = chunk.strip()
+        if token and not token.startswith("#"):
+            items.append(token)
+    return items
+
+
+def _compile_variant(variant: str, *, filename_safe: bool) -> re.Pattern[str]:
+    escaped = re.escape(variant)
+    if filename_safe:
+        # Underscore and hyphen are filename separators, so ``ZEBULON_scan.pdf``
+        # and ``zebulon-notes`` must match a lone given name.
+        return re.compile(rf"(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])", re.IGNORECASE)
+    if re.match(r"\w", variant):
+        head = r"\b"
+    else:
+        head = ""
+    if re.search(r"\w$", variant):
+        tail = r"\b"
+    else:
+        tail = ""
+    return re.compile(f"{head}{escaped}{tail}", re.IGNORECASE)
+
+
 def _unique_terms(collected: Iterable[str]) -> List[str]:
     seen: Set[str] = set()
     unique: List[str] = []
@@ -135,9 +193,11 @@ def _unique_terms(collected: Iterable[str]) -> List[str]:
 class SensitiveTerms:
     """Case-insensitive whole-word matcher over user-supplied private terms.
 
-    Internally terms expand to include ``Last, First`` variants and the
-    matcher only reports counts — never the matched values — so results are
-    safe to log.
+    Internally terms expand to include ``Last, First`` variants and, for
+    user-supplied names, the lone given-name token. Matching is
+    case-insensitive (including ALL CAPS) and treats ``_`` / ``-`` as
+    boundaries so filenames and paths match. The matcher only reports
+    counts — never the matched values — so results are safe to log.
 
     ``terms`` is the full matching list (builtins + user file + extras).
     ``file_terms`` is only what the user supplied (``private_terms.txt`` and
@@ -154,6 +214,7 @@ class SensitiveTerms:
         path: Optional[Path | str] = None,
         extra_terms: Optional[Iterable[str]] = None,
         include_builtins: bool = True,
+        include_env: bool = True,
     ) -> "SensitiveTerms":
         collected: List[str] = []
         user_collected: List[str] = []
@@ -169,6 +230,10 @@ class SensitiveTerms:
             extras = [t for t in extra_terms if t]
             collected.extend(extras)
             user_collected.extend(extras)
+        if include_env:
+            env_terms = _terms_from_env()
+            collected.extend(env_terms)
+            user_collected.extend(env_terms)
         return cls(terms=_unique_terms(collected), file_terms=_unique_terms(user_collected))
 
     def _expanded(self) -> List[str]:
@@ -178,22 +243,20 @@ class SensitiveTerms:
         return out
 
     def _compiled(self) -> List[re.Pattern[str]]:
+        file_keys = {t.lower() for t in self.file_terms}
         patterns: List[re.Pattern[str]] = []
-        for variant in self._expanded():
-            escaped = re.escape(variant)
-            # Honor whole-word boundaries only when the term itself starts
-            # and ends with a word character. Terms that end in punctuation
-            # (``"Section 504"``) still get boundary-matched on the leading
-            # word char.
-            if re.match(r"\w", variant):
-                head = r"\b"
-            else:
-                head = ""
-            if re.search(r"\w$", variant):
-                tail = r"\b"
-            else:
-                tail = ""
-            patterns.append(re.compile(f"{head}{escaped}{tail}", re.IGNORECASE))
+        seen: Set[str] = set()
+        for term in self.terms:
+            is_user = term.lower() in file_keys
+            variants = list(_expand_name_variants(term))
+            if is_user:
+                variants.extend(_given_name_tokens(term))
+            for variant in variants:
+                key = (variant.lower(), is_user)
+                if key in seen:
+                    continue
+                seen.add(key)
+                patterns.append(_compile_variant(variant, filename_safe=is_user))
         return patterns
 
     def count_hits(self, text: str) -> int:
@@ -217,7 +280,8 @@ class SensitiveTerms:
         """True iff ``text`` contains a *user-supplied* private term.
 
         Built-in topical keywords are excluded. Matching is case-insensitive
-        with whole-word boundaries (including ``Last, First`` name variants).
+        (including ALL CAPS) with filename-safe boundaries, ``Last, First``
+        variants, and lone given-name tokens from multi-word terms.
         """
         if not text or not self.file_terms:
             return False
@@ -954,9 +1018,10 @@ def assert_safe_for_outbound(text: str, terms: Optional[SensitiveTerms] = None) 
     * Residual number PII (SSN / EIN / account / card shapes).
     * Card/account 4-digit fragments, US street addresses, and Title-Case
       person-name runs.
-    * User-supplied private terms from ``config/private_terms.txt`` (or
-      ``terms.file_terms`` when a matcher is passed), case-insensitive with
-      word boundaries.
+    * User-supplied private terms from ``config/private_terms.txt``,
+      ``PRIVATE_TERMS`` / ``SCAN_PRIVATE_TERMS``, or ``terms.file_terms``
+      when a matcher is passed. Case-insensitive including ALL CAPS;
+      lone given names match on their own; ``_`` / ``-`` are boundaries.
     """
     if _residual_pii_count(text) > 0:
         raise ValueError(
