@@ -14,12 +14,12 @@ import json
 import logging
 import os
 import sys
-from datetime import date, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Sequence
 
 from . import __version__
-from .classifier import ClassifierSettings
+from .classifier import ClassifierSettings, provider_probe
 from .config import (
     DEFAULT_CONFIDENCE_THRESHOLD,
     DEFAULT_LOG_DIRNAME,
@@ -29,6 +29,7 @@ from .config import (
     DEFAULT_SRC_NAME,
     DEFAULT_UNSORTED_NAME,
     PROVIDERS,
+    utc_run_stamp,
 )
 from .manifest import undo as undo_manifest
 from .organizer import RunConfig, process_batch, refile_folders
@@ -73,6 +74,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--dry-run", action="store_true",
                    help="Write the manifest and print the plan without moving anything.")
+    p.add_argument("--print-prompts", action="store_true",
+                   help="Offline mode (requires --dry-run): write the exact final "
+                        "outbound prompt for each file that would go to a provider "
+                        "to prompts-<UTC timestamp>.jsonl (mode 0600). Makes zero "
+                        "network calls even if API keys are set.")
+    p.add_argument("--provider-probe", action="store_true",
+                   help="Send a content-free 'ping' to the chosen provider, print "
+                        "HTTP status / error body, and exit. Does not process files.")
     p.add_argument("--limit", type=int, default=None,
                    help="Process at most N files (useful for incremental backfills).")
     p.add_argument("--non-interactive", action="store_true",
@@ -87,7 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--summary-only", action="store_true",
                    help="Skip processing; just write a summary from existing manifests in --log.")
     p.add_argument("--no-summary", action="store_true",
-                   help="Suppress writing the summary-YYYY-MM-DD.md file at the end of a run.")
+                   help="Suppress writing the summary-<UTC timestamp>.md file at the end of a run.")
     p.add_argument("--verbose", "-v", action="count", default=0,
                    help="Increase logging verbosity (-v info, -vv debug).")
     return p
@@ -145,8 +154,12 @@ def _build_runconfig(args: argparse.Namespace) -> RunConfig:
     terms = SensitiveTerms.load(args.private_terms)
     settings = ClassifierSettings(provider=args.provider, model=args.model)
 
-    manifest_name = datetime.utcnow().strftime("manifest-%Y%m%dT%H%M%SZ.jsonl")
-    manifest_path = args.log / manifest_name
+    stamp = utc_run_stamp()
+    args.run_stamp = stamp
+    manifest_path = args.log / f"manifest-{stamp}.jsonl"
+    prompts_path = None
+    if getattr(args, "print_prompts", False):
+        prompts_path = args.log / f"prompts-{stamp}.jsonl"
 
     return RunConfig(
         src=args.src,
@@ -162,6 +175,9 @@ def _build_runconfig(args: argparse.Namespace) -> RunConfig:
         recursive=bool(args.recursive),
         ocr_pages=int(args.ocr_pages),
         hash_skip_dirs={args.dest},
+        run_stamp=stamp,
+        print_prompts=bool(getattr(args, "print_prompts", False)),
+        prompts_path=prompts_path,
     )
 
 
@@ -176,15 +192,16 @@ def _print_outcomes(outcomes, dry_run: bool) -> None:
         print(f"  {tag:<16}{prov} {o.src} -> {dest}{reason}")
 
 
-def _write_summary(args: argparse.Namespace, outcomes) -> Optional[Path]:
+def _write_summary(args: argparse.Namespace, outcomes, stamp: Optional[str] = None) -> Optional[Path]:
     if args.no_summary:
         return None
     manifests = sorted(args.log.glob("manifest-*.jsonl"))
     from .summary import summarize_manifest_files
     summary = summarize_manifest_files(manifests)
-    today = date.today()
-    out = args.log / f"summary-{today.isoformat()}.md"
-    return write_summary(summary, out, when=today)
+    stamp = stamp or getattr(args, "run_stamp", None) or utc_run_stamp()
+    when = datetime.now(timezone.utc).date()
+    out = args.log / f"summary-{stamp}.md"
+    return write_summary(summary, out, when=when)
 
 
 def _run_interactive(parser: argparse.ArgumentParser) -> int:
@@ -215,6 +232,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     args = parser.parse_args(argv)
     _configure_logging(args.verbose)
+
+    if args.print_prompts and not args.dry_run:
+        parser.error("--print-prompts requires --dry-run")
+
+    if args.provider_probe:
+        settings = ClassifierSettings(provider=args.provider, model=args.model)
+        result = provider_probe(settings)
+        print(json.dumps(result, indent=2))
+        return 0 if result.get("ok") else 2
+
     args = _resolve_paths(args)
 
     if args.undo is not None:
@@ -232,7 +259,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.log.mkdir(parents=True, exist_ok=True)
         from .summary import summarize_manifest_files
         summary = summarize_manifest_files(sorted(args.log.glob("manifest-*.jsonl")))
-        out = write_summary(summary, args.log / f"summary-{date.today().isoformat()}.md")
+        stamp = utc_run_stamp()
+        out = write_summary(summary, args.log / f"summary-{stamp}.md")
         print(f"Wrote summary {out}")
         return 0
 
@@ -243,6 +271,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"  review_dir : {cfg.review_dir}")
     print(f"  unsorted   : {cfg.unsorted_dir}")
     print(f"  manifest   : {cfg.manifest_path}")
+    if cfg.print_prompts and cfg.prompts_path:
+        print(f"  prompts    : {cfg.prompts_path}  (offline, no network)")
     print(f"  taxonomy   : {args.taxonomy}  (threshold={cfg.taxonomy.confidence_threshold})")
     terms_count = len(cfg.sensitive_terms.terms)
     print(
@@ -259,7 +289,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     counts = result.tally()
     print("\nCounts:", json.dumps(counts))
 
-    summary_path = _write_summary(args, result.outcomes)
+    summary_path = _write_summary(args, result.outcomes, stamp=cfg.run_stamp)
     if summary_path:
         print(f"Summary: {summary_path}")
 

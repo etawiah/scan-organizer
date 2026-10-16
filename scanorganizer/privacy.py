@@ -300,6 +300,379 @@ _RESIDUAL_GROUPED_RE = re.compile(
 )
 
 
+# -- Card / account fragments, US addresses, person-name heuristic ------------
+#
+# These catch the shapes that slipped a dry-run outbound gate: a third
+# party's full name plus a 4-digit card fragment, and person names plus a
+# US street address. Placeholders are typed: [CARD], [ADDRESS], [NAME].
+
+_CARD_FRAG_RE = re.compile(
+    r"""(?ix)
+    (?:
+        (?:(?:the\s+)?(?:card|account|acct)\s+)?ending(?:\s+in)?\s+\d{4}
+        |
+        last\s*4\s*:?\s*\d{4}
+        |
+        (?:acct|account)(?:\s+(?:number|no\.?))?\s*\#\s*\d{4}
+        |
+        (?:acct|account)\s+\#?\d{4}
+        |
+        (?:x{2,}|\*{2,}|\.{3,}|[xX]-)\d{4}
+    )
+    \b
+    """
+)
+
+_STREET_SUFFIX_RE = (
+    r"(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Ln|Lane|"
+    r"Dr|Drive|Ct|Court|Way|Pl|Place|Ter|Terrace|Cir|Circle|"
+    r"Hwy|Highway|(?:US\s+)?(?:Route|Rte))\b\.?"
+)
+
+_SUITE_RE = r"(?:Suite|Ste|Apt|Apartment|Unit|\#|PMB)\.?\s*[A-Za-z0-9-]+"
+
+_US_STATE_ABBR = (
+    r"AL|AK|AZ|AR|CA|CO|CT|DC|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|"
+    r"MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|PR|RI|SC|SD|TN|"
+    r"TX|UT|VA|VT|WA|WI|WV|WY"
+)
+
+# House number + street name + suffix, optional suite, optional city/state/ZIP.
+_ADDRESS_RE = re.compile(
+    rf"""
+    \b
+    \d{{1,6}}
+    [\s_\-]+
+    (?:[A-Z][A-Za-z0-9.']+[\s_\-]+){{1,5}}
+    {_STREET_SUFFIX_RE}
+    (?:[\s,]+{_SUITE_RE})?
+    (?:
+        [\s,]+
+        [A-Z][A-Za-z .'-]+
+        [\s,]+
+        (?:{_US_STATE_ABBR})
+        (?:[\s,]+(?:\d{{5}}(?:-\d{{4}})?))?
+    )?
+    """,
+    re.VERBOSE,
+)
+
+# Standalone 5-digit ZIP or ZIP+4 sitting next to a state abbreviation.
+_STATE_ZIP_RE = re.compile(
+    rf"\b(?:{_US_STATE_ABBR})\s+\d{{5}}(?:-\d{{4}})?\b"
+)
+
+_HONORIFIC_RE = re.compile(
+    r"\b(?:Mr|Mrs|Ms|Dr)\.?"
+    r"[\s_\-]+"
+    r"[A-Z][a-z]+(?:[\s_\-]+[A-Z][a-z]+){0,2}\b"
+)
+
+_LAST_FIRST_RE = re.compile(
+    r"\b[A-Z][a-z]+,\s+[A-Z][a-z]+(?:[\s_\-]+[A-Z][a-z]+)?\b"
+)
+
+_TITLE_TOKEN_RE = re.compile(r"[A-Z][a-z]+")
+
+# Tokens that almost never start or form a person name on a household scan.
+# Category / org / document words stay visible so the classifier still has
+# signal after the name heuristic runs.
+_NAME_ALLOWLIST = frozenset({
+    # months / days
+    "january", "february", "march", "april", "may", "june", "july",
+    "august", "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept",
+    "oct", "nov", "dec",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
+    "sunday", "mon", "tue", "tues", "wed", "thu", "thur", "thurs",
+    "fri", "sat", "sun",
+    # US states and common geographic words
+    "alabama", "alaska", "arizona", "arkansas", "california", "colorado",
+    "connecticut", "delaware", "florida", "georgia", "hawaii", "idaho",
+    "illinois", "indiana", "iowa", "kansas", "kentucky", "louisiana",
+    "maine", "maryland", "massachusetts", "michigan", "minnesota",
+    "mississippi", "missouri", "montana", "nebraska", "nevada",
+    "hampshire", "jersey", "mexico", "york", "carolina", "dakota",
+    "ohio", "oklahoma", "oregon", "pennsylvania", "rhode", "island",
+    "tennessee", "texas", "utah", "vermont", "virginia", "washington",
+    "wisconsin", "wyoming", "columbia", "district",
+    "new", "north", "south", "east", "west", "united", "states",
+    "america", "american",
+    # taxonomy / org / document words
+    "personal", "family", "household", "business", "campaign", "spouse",
+    "kids", "mother", "home", "vehicles",
+    "bank", "insurance", "statement", "statements", "department",
+    "internal", "revenue", "service", "services",
+    "invoice", "invoices", "receipt", "receipts", "account", "accounts",
+    "payable", "receivable", "agreement", "contract", "contracts",
+    "license", "licenses", "policy", "premium", "coverage",
+    "medical", "record", "records", "patient", "provider", "diagnosis",
+    "prescription", "explanation", "benefits", "driver", "passport",
+    "social", "security", "marriage", "certificate", "notary",
+    "electric", "company", "companies", "utility", "utilities", "bill",
+    "bills", "monthly", "quarterly", "annual", "vehicle", "registration",
+    "renewal", "tax", "taxes", "return", "form", "year", "filing",
+    "status", "total", "income", "refund", "due", "amount", "paid",
+    "balance", "payment", "payments", "deposit", "withdrawal",
+    "checking", "savings", "mortgage", "rent", "lease", "tenant",
+    "tenants", "landlord", "property", "warranty", "warranties",
+    "repair", "repairs", "estimate", "contractor", "plumber",
+    "finance", "disclosure", "report", "reports", "contribution",
+    "donation", "donations", "expense", "expenses", "corporate",
+    "articles", "organization", "operating", "master", "scope",
+    "platform", "integration", "deliverables", "complex", "tech",
+    "first", "correspondence", "letter", "dear", "sincerely",
+    "regards", "whom", "concern", "city", "state", "county", "federal",
+    "treasury", "government", "office", "bureau", "agency",
+    "administration", "commission", "board", "school", "elementary",
+    "middle", "high", "college", "university", "hospital", "clinic",
+    "health", "care", "pharmacy", "laboratory", "imaging", "dental",
+    "vision", "wellness", "child", "children", "pediatric", "parent",
+    "teacher", "homeroom", "transcript", "immunization", "card",
+    "cards", "number", "numbers", "date", "dates", "period", "billing",
+    "address", "street", "avenue", "road", "boulevard", "lane",
+    "drive", "court", "route", "highway", "place", "terrace", "circle",
+    "suite", "apartment", "unit", "legal", "id", "identification",
+    "out", "terms", "conditions", "apply", "privacy", "please",
+    "verify", "member", "applicant", "reference", "shipment",
+    "arrived", "today", "thank", "you", "original", "filename",
+    "document", "documents", "text", "sensitive", "values", "already",
+    "redacted", "allowed", "taxonomy", "nodes", "owner", "area",
+    "empty", "string", "segment", "return", "only", "json", "object",
+    "these", "keys", "nothing", "else", "must", "pick", "exactly",
+    "one", "scan", "scanned", "classifying", "household", "strict",
+    "confidence", "unknown", "descriptive", "lowercase", "words",
+    "underscores", "extension", "cannot", "confidently", "place",
+    "rather", "guessing", "caller", "will", "route", "low", "human",
+    "review", "page", "pages", "attached", "schedule", "updated",
+    "used", "charged", "debited", "overdue", "issued", "dated",
+    "consulting", "contractor", "vendor", "payroll", "wire",
+    "routing", "on", "file", "for", "the", "and", "this", "that",
+    "from", "with", "your", "our", "any", "all", "each", "every",
+    "llc", "inc", "ltd", "corp", "corporation", "co",
+    "acme", "sample", "placeholder", "fictional",
+    "utilities", "registration", "activities", "compliance",
+    "filings", "donations", "invoices",
+    "in", "of", "or", "to", "by", "as", "at", "an", "a",
+    "compliance", "legal", "loan", "payroll", "corporate",
+    "activities", "warranties", "property",
+})
+
+_ORG_SUFFIXES = frozenset({
+    "school", "elementary", "middle", "hospital", "company", "companies",
+    "service", "services", "department", "agreement", "statement",
+    "statements", "llc", "inc", "ltd", "corp", "corporation", "co",
+    "bank", "insurance", "district", "university", "college", "clinic",
+    "agency", "bureau", "office", "commission", "board", "association",
+    "foundation", "trust", "group", "partners", "holdings",
+    "technologies", "solutions", "systems", "bill", "invoice",
+    "invoices", "receipt", "receipts", "form", "return", "filing",
+    "report", "reports", "records", "record", "policy", "license",
+    "licenses", "registration", "renewal", "utilities", "utility",
+    "electric", "campaign", "committee", "treasury", "revenue",
+    "administration", "hospital",
+})
+
+_STREET_SUFFIX_WORDS = frozenset({
+    "st", "street", "ave", "avenue", "rd", "road", "blvd", "boulevard",
+    "ln", "lane", "dr", "drive", "ct", "court", "way", "pl", "place",
+    "ter", "terrace", "cir", "circle", "hwy", "highway", "route", "rte",
+})
+
+_MONTH_DAY_WORDS = frozenset({
+    "january", "february", "march", "april", "may", "june", "july",
+    "august", "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept",
+    "oct", "nov", "dec",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
+    "sunday",
+})
+
+
+def _is_name_tokens(tokens: Sequence[str]) -> bool:
+    """True when a 2–3 Title-Case run looks like a person name."""
+    if not tokens or not (2 <= len(tokens) <= 3):
+        return False
+    lowered = [t.lower() for t in tokens]
+    if any(t in _STREET_SUFFIX_WORDS for t in lowered):
+        return False
+    if lowered[-1] in _ORG_SUFFIXES:
+        return False
+    if all(t in _NAME_ALLOWLIST for t in lowered):
+        return False
+    if lowered[0] in _MONTH_DAY_WORDS:
+        return False
+    return True
+
+
+def _adjacent_title_runs(text: str) -> List[List[Tuple[int, int, str]]]:
+    """Group adjacent Title-Case tokens (space / _ / - / 'and')."""
+    tokens = [(m.start(), m.end(), m.group(0)) for m in _TITLE_TOKEN_RE.finditer(text)]
+    if not tokens:
+        return []
+    runs: List[List[Tuple[int, int, str]]] = []
+    current = [tokens[0]]
+    for prev, tok in zip(tokens, tokens[1:]):
+        between = text[prev[1]:tok[0]]
+        # Horizontal separators only — a newline (taxonomy listings,
+        # ``- Item`` bullets) must start a new run.
+        if re.fullmatch(r"[ \t_\-]+", between) or re.fullmatch(r"[ \t]+and[ \t]+", between):
+            current.append(tok)
+        else:
+            runs.append(current)
+            current = [tok]
+    runs.append(current)
+    return runs
+
+
+def _name_spans(text: str) -> List[Tuple[int, int]]:
+    """Return ``(start, end)`` spans that the name heuristic should scrub."""
+    if not text:
+        return []
+    spans: List[Tuple[int, int]] = []
+    for match in _HONORIFIC_RE.finditer(text):
+        spans.append(match.span())
+    for match in _LAST_FIRST_RE.finditer(text):
+        last, first = match.group(0).split(",", 1)
+        last_tok = last.strip()
+        first_toks = [p for p in re.split(r"[\s_\-]+", first.strip()) if p]
+        if _is_name_tokens([last_tok, *first_toks][:3]):
+            spans.append(match.span())
+    for run in _adjacent_title_runs(text):
+        words = [tok for _s, _e, tok in run]
+        # Prefer the longest window that looks like a name.
+        replaced = [False] * len(run)
+        for window in (3, 2):
+            if len(run) < window:
+                continue
+            i = 0
+            while i <= len(run) - window:
+                if any(replaced[i:i + window]):
+                    i += 1
+                    continue
+                if _is_name_tokens(words[i:i + window]):
+                    spans.append((run[i][0], run[i + window - 1][1]))
+                    for j in range(i, i + window):
+                        replaced[j] = True
+                    i += window
+                else:
+                    i += 1
+    # Merge overlapping / adjacent spans so "Zebulon and Marta Quill"
+    # becomes a single [NAME] even if windows overlapped.
+    if not spans:
+        return []
+    spans.sort()
+    merged: List[Tuple[int, int]] = [spans[0]]
+    for start, end in spans[1:]:
+        prev_s, prev_e = merged[-1]
+        gap = text[prev_e:start]
+        if start <= prev_e or re.fullmatch(r"[ \t_\-]+", gap) or re.fullmatch(r"[ \t]+and[ \t]+", gap):
+            merged[-1] = (prev_s, max(prev_e, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _find_card_fragments(text: str) -> List[str]:
+    if not text:
+        return []
+    return _CARD_FRAG_RE.findall(text)
+
+
+def _find_addresses(text: str) -> List[str]:
+    if not text:
+        return []
+    found = _ADDRESS_RE.findall(text)
+    found.extend(_STATE_ZIP_RE.findall(text))
+    return found
+
+
+def _find_names(text: str) -> List[str]:
+    return [text[s:e] for s, e in _name_spans(text)]
+
+
+def _redact_addresses(text: str) -> Tuple[str, int]:
+    """Replace US street / state+ZIP shapes. Run *before* grouped-account."""
+    if not text:
+        return text, 0
+    count = 0
+
+    def _addr_sub(match: re.Match[str]) -> str:
+        nonlocal count
+        count += 1
+        return "[ADDRESS]"
+
+    out = _ADDRESS_RE.sub(_addr_sub, text)
+    out = _STATE_ZIP_RE.sub(_addr_sub, out)
+    return out, count
+
+
+def _redact_card_fragments(text: str) -> Tuple[str, int]:
+    """Replace 4-digit card/account fragments. Run *after* full PAN redaction."""
+    if not text:
+        return text, 0
+    out, n = _CARD_FRAG_RE.subn("[CARD]", text)
+    return out, n
+
+
+def _redact_names(text: str) -> Tuple[str, int]:
+    """Replace Title-Case person-name runs."""
+    if not text:
+        return text, 0
+    spans = _name_spans(text)
+    if not spans:
+        return text, 0
+    pieces: List[str] = []
+    cursor = 0
+    count = 0
+    for start, end in spans:
+        pieces.append(text[cursor:start])
+        pieces.append("[NAME]")
+        count += 1
+        cursor = end
+    pieces.append(text[cursor:])
+    out = "".join(pieces)
+    # Conjunction leftovers: "Zebulon and [NAME]" / "[NAME] and Marta".
+    out, n = re.subn(r"\b[A-Z][a-z]+\s+and\s+\[NAME\]", "[NAME]", out)
+    count += n
+    out, n = re.subn(r"\[NAME\]\s+and\s+[A-Z][a-z]+\b", "[NAME]", out)
+    count += n
+    return out, count
+
+
+def _redact_identity(text: str, *, addresses: bool = True, cards: bool = True, names: bool = True) -> Tuple[str, Dict[str, int]]:
+    """Scrub card fragments, US addresses, and Title-Case person names.
+
+    Returns ``(scrubbed_text, counts)`` with keys ``card``, ``address``,
+    ``name``. Applied to OCR text, filenames, and paths.
+    """
+    counts: Dict[str, int] = {"card": 0, "address": 0, "name": 0}
+    if not text:
+        return text, counts
+    out = text
+    if addresses:
+        out, n = _redact_addresses(out)
+        counts["address"] += n
+    if cards:
+        out, n = _redact_card_fragments(out)
+        counts["card"] += n
+    if names:
+        out, n = _redact_names(out)
+        counts["name"] += n
+    return out, counts
+
+
+def _identity_leak_count(text: str) -> int:
+    """Count name / address / card-fragment shapes still present in ``text``."""
+    if not text:
+        return 0
+    return (
+        len(_find_card_fragments(text))
+        + len(_find_addresses(text))
+        + len(_find_names(text))
+    )
+
+
 # -- Luhn helper --------------------------------------------------------------
 
 
@@ -416,7 +789,8 @@ def _residual_pii_count(scrubbed: str) -> int:
 
     This is the belt-and-suspenders check used to decide whether a document
     is safe to send to an external LLM. A healthy redaction pass should
-    return zero here.
+    return zero here. Includes number-shaped IDs plus the name / address /
+    card-fragment shapes that must never appear in an outbound prompt.
     """
     if not scrubbed:
         return 0
@@ -425,6 +799,7 @@ def _residual_pii_count(scrubbed: str) -> int:
         + len(_RESIDUAL_EIN_RE.findall(scrubbed))
         + len(_RESIDUAL_LONG_DIGITS_RE.findall(scrubbed))
         + len(_RESIDUAL_GROUPED_RE.findall(scrubbed))
+        + _identity_leak_count(scrubbed)
     )
 
 
@@ -448,9 +823,17 @@ def redact(text: str) -> str:
     """Backwards-compatible helper: apply PII redaction and return the text.
 
     New callers should prefer :func:`gate` so the privacy verdict and
-    category counts come back together.
+    category counts come back together. Applied to OCR text, filenames,
+    and paths: number-shaped IDs plus card fragments, US addresses, and
+    Title-Case person-name runs.
     """
-    scrubbed, _ = _redact_pii(text)
+    # Addresses (including state+ZIP / ZIP+4) must run before the
+    # grouped-account rule so ``NJ 00000-0000`` is not eaten as an acct.
+    # Full PANs run next so ``ending in 4111 1111 1111 1111`` is a card,
+    # then leftover 4-digit fragments and person names.
+    scrubbed, _ = _redact_identity(text, cards=False, names=False)
+    scrubbed, _ = _redact_pii(scrubbed)
+    scrubbed, _ = _redact_identity(scrubbed, addresses=False)
     return scrubbed
 
 
@@ -464,13 +847,16 @@ def gate(text: str, terms: SensitiveTerms) -> RedactionReport:
        built-ins). A non-zero hit count means ``sensitive`` immediately —
        no amount of further scrubbing will unblock an outbound call.
     2. Redact SSN / EIN / account / card / DOB in a single ordered pass.
-    3. Re-scan the scrubbed output for residual PII shapes. Anything that
+    3. Redact card/account 4-digit fragments, US street addresses, and
+       Title-Case person-name runs (filenames and paths use this same pass).
+    4. Re-scan the scrubbed output for residual PII shapes. Anything that
        slips through flips ``sensitive`` to true.
-    4. Count topical sensitive-subject keywords. ``>= TOPICAL_HIT_THRESHOLD``
+    5. Count topical sensitive-subject keywords. ``>= TOPICAL_HIT_THRESHOLD``
        flips ``sensitive`` to true even when all values were scrubbed.
     """
     counts: Dict[str, int] = {"private_term": 0, "ssn": 0, "ein": 0,
                               "acct": 0, "card": 0, "dob": 0,
+                              "address": 0, "name": 0,
                               "residual_pii": 0, "topic": 0}
     if not text:
         return RedactionReport(scrubbed_text=text or "", category_counts=counts)
@@ -478,9 +864,16 @@ def gate(text: str, terms: SensitiveTerms) -> RedactionReport:
     scrubbed, private_hits = terms.redact(text)
     counts["private_term"] = private_hits
 
+    # Addresses / ZIP+4 before grouped-account so state+ZIP is not an acct.
+    # Full PANs next; leftover 4-digit fragments and names after that.
+    scrubbed, identity_first = _redact_identity(scrubbed, cards=False, names=False)
     scrubbed, pii_counts = _redact_pii(scrubbed)
     for k, v in pii_counts.items():
         counts[k] = v
+    scrubbed, identity_counts = _redact_identity(scrubbed, addresses=False)
+    counts["card"] += identity_first.get("card", 0) + identity_counts.get("card", 0)
+    counts["address"] = identity_first.get("address", 0) + identity_counts.get("address", 0)
+    counts["name"] = identity_first.get("name", 0) + identity_counts.get("name", 0)
 
     residual = _residual_pii_count(scrubbed)
     counts["residual_pii"] = residual
@@ -523,7 +916,7 @@ def sanitize_outbound_label(value: str, terms: Optional[SensitiveTerms] = None) 
         if _residual_pii_count(report.scrubbed_text) > 0:
             return ""
         return report.scrubbed_text
-    scrubbed, _ = _redact_pii(value)
+    scrubbed = redact(value)
     if _residual_pii_count(scrubbed) > 0:
         return ""
     return scrubbed
@@ -559,6 +952,8 @@ def assert_safe_for_outbound(text: str, terms: Optional[SensitiveTerms] = None) 
     Checks:
 
     * Residual number PII (SSN / EIN / account / card shapes).
+    * Card/account 4-digit fragments, US street addresses, and Title-Case
+      person-name runs.
     * User-supplied private terms from ``config/private_terms.txt`` (or
       ``terms.file_terms`` when a matcher is passed), case-insensitive with
       word boundaries.

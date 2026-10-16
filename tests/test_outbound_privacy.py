@@ -74,12 +74,12 @@ def _write(path: Path, body: str) -> None:
 # -- Direct classifier-level assertions --------------------------------------
 
 
-def test_default_models_are_cheap_older_tiers():
+def test_default_models_are_cheap_flash_tiers():
     assert DEFAULT_ANTHROPIC_MODEL == "claude-3-haiku-20240307"
-    assert DEFAULT_GEMINI_MODEL == "gemini-2.0-flash"
-    # Belt-and-suspenders: must not point at a 'sonnet', 'opus', or
-    # 2.5-flash tier by default.
-    for forbidden in ("sonnet", "opus", "2.5", "pro"):
+    # gemini-2.0-flash shut down 2026-06-01; default is the cheap Flash tier
+    # still served (2.5), never a Pro / Ultra / thinking frontier id.
+    assert DEFAULT_GEMINI_MODEL == "gemini-2.5-flash"
+    for forbidden in ("sonnet", "opus", "pro", "ultra"):
         assert forbidden not in DEFAULT_ANTHROPIC_MODEL.lower()
         assert forbidden not in DEFAULT_GEMINI_MODEL.lower()
 
@@ -419,7 +419,7 @@ def test_assert_safe_for_outbound_raises_on_private_term_in_prompt():
     terms = SensitiveTerms.load(
         path=None, extra_terms=[FAKE_PRIVATE_NAME], include_builtins=False,
     )
-    with pytest.raises(ValueError, match="private term"):
+    with pytest.raises(ValueError):
         assert_safe_for_outbound(
             f"Original filename: notes {FAKE_PRIVATE_NAME}.pdf\nDocument text",
             terms,

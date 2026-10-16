@@ -36,9 +36,9 @@ reachable, plus:
   validated against it; anything invalid or low‑confidence lands in `_Review/`
   — never in a brand‑new folder.
 - Classifier choice: `--provider anthropic|gemini|local-keyword`. The
-  Anthropic and Gemini defaults are deliberately older, cheap tiers
-  (`claude-3-haiku-20240307` and `gemini-2.0-flash`), never the newest
-  frontier models.
+  Anthropic and Gemini defaults are deliberately cheap hosted tiers
+  (`claude-3-haiku-20240307` and `gemini-2.5-flash`). Gemini 2.0 Flash
+  shut down in June 2026.
 - A **single local redaction gate** runs before any outbound call. It
   guarantees that no children's PII — and no SSN, EIN, routing, account,
   or card number — ever reaches a frontier model. Any private-term hit
@@ -49,7 +49,13 @@ reachable, plus:
 - Re‑file mode: `--refile <dir>` promotes files from legacy flat folders into
   the new taxonomy (dry‑run capable).
 - `--dry-run`, `--limit`, `--non-interactive`.
-- Weekly `summary-YYYY-MM-DD.md` with per‑folder counts and the `_Review` list.
+- Per-run `summary-<UTC timestamp>.md` (same stamp scheme as the manifest)
+  with per‑folder counts and the `_Review` list. Runs never overwrite each
+  other.
+- `--print-prompts --dry-run` writes the exact final outbound prompt for
+  each file that would hit a provider to `prompts-<UTC timestamp>.jsonl`
+  (mode `0600`) and makes zero network calls.
+- `--provider-probe` sends a content-free `ping` and prints HTTP status.
 - `Dockerfile`, `docker-compose.yml`, cron + systemd‑timer samples.
 - `test_api_key.py` no longer prints any portion of the API key (supersedes
   [PR #1](https://github.com/etawiah/scan-organizer/pull/1)).
@@ -72,7 +78,11 @@ For each file in `--src`:
    * SSNs (`123-45-6789`, spaced, and 9-digit unformatted near SSN
      keywords), EINs (`##-#######`), account/routing numbers (digit runs
      of 8+ allowing spaces/dashes), payment cards (Luhn-valid 13–19 digit
-     runs tagged `[REDACTED_CARD]`), and labeled DOBs are scrubbed.
+     runs tagged `[REDACTED_CARD]`), labeled DOBs, **card/account
+     4-digit fragments**, **US street addresses**, and **Title-Case
+     person-name runs** are scrubbed. Fragments / addresses / names use
+     typed placeholders `[CARD]`, `[ADDRESS]`, `[NAME]`.
+   * The same pass is applied to OCR text, filenames, and paths.
    * The scrubbed text is re-scanned for residual PII shapes and for
      topical signals (SSN / tax / medical / school keywords). A hit on
      either keeps the document local.
@@ -82,7 +92,10 @@ For each file in `--src`:
    `--provider` for a JSON classification:
    `{owner, area, doc_type, doc_date, confidence, short_name}`.
    A defensive residual-PII check inside every provider call refuses to
-   transmit anything that still matches an ID pattern.
+   transmit anything that still matches an ID, card fragment, US
+   address, or person-name pattern. Documents whose local keyword
+   pre-pass (or classification) is `Finance-Bank`, `ID-Legal`, or
+   `Medical` stay local-only; override with `LOCAL_ONLY_CATEGORIES`.
 6. The result is validated against `taxonomy.yaml`.
    - Not in the taxonomy → `_Review/`.
    - `confidence < confidence_threshold` (default 0.75) → `_Review/`.
@@ -147,13 +160,15 @@ Behavior:
 | `--confidence-threshold FLOAT` | Overrides the YAML threshold. |
 | `--ocr-pages N` | PDF pages to OCR. Default `5`. |
 | `--dry-run` | Write the manifest and print the plan; move nothing. |
+| `--print-prompts` | Requires `--dry-run`. Write `prompts-<UTC timestamp>.jsonl` (mode 0600) with the exact final outbound prompt for each file that would go to a provider. Zero network calls. |
+| `--provider-probe` | Send a content-free `ping` to `--provider`, print status, exit. |
 | `--limit N` | Process at most N files (good for incremental backfills). |
 | `--non-interactive` | Never prompt. Required for Docker / cron / systemd. |
 | `--recursive` | Descend into subdirectories of `--src`. |
 | `--refile DIR` | Re‑classify files already in a legacy folder (repeatable). |
 | `--undo MANIFEST` | Reverse the moves recorded in `MANIFEST` and exit. |
-| `--summary-only` | Skip processing; just rewrite today's summary from `--log`. |
-| `--no-summary` | Don't write the weekly summary at the end of a run. |
+| `--summary-only` | Skip processing; just write a new `summary-<UTC timestamp>.md` from `--log`. |
+| `--no-summary` | Don't write the summary at the end of a run. |
 | `-v` / `-vv` | More logging. |
 
 Environment variables honored:
@@ -164,8 +179,11 @@ Environment variables honored:
   provider is active unless a provider‑specific override is also set).
 - `SCAN_ANTHROPIC_MODEL` — override for the Anthropic model.
   Defaults to `claude-3-haiku-20240307` (older, cheap Haiku tier).
-- `SCAN_GEMINI_MODEL` — override for the Gemini model.
-  Defaults to `gemini-2.0-flash` (older, cheap Flash tier).
+- `GEMINI_MODEL` / `SCAN_GEMINI_MODEL` — override for the Gemini model.
+  Defaults to `gemini-2.5-flash` (cheap Flash tier; 2.0 is no longer
+  served). `GEMINI_MODEL` wins.
+- `LOCAL_ONLY_CATEGORIES` — comma-separated doc_types that stay
+  on-host (default `Finance-Bank,ID-Legal,Medical`). Empty disables.
 - `ANTHROPIC_API_KEY` — required when `--provider anthropic`.
 - `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) — required when `--provider gemini`.
 
@@ -223,6 +241,14 @@ repeated.
     separated by spaces or dashes (groups of 3+ digits).
   * Payment cards — Luhn‑valid 13–19 digit sequences, tagged as
     `[REDACTED_CARD]`.
+  * Card / account 4-digit fragments (`ending in 1234`, `xxxx1234`,
+    `acct #1234`, `last 4: 1234`, …) tagged `[CARD]`.
+  * US street addresses (number + name + suffix, optional suite/apt,
+    city/state/ZIP, and state+ZIP) tagged `[ADDRESS]`.
+  * Title-Case 2–3 token person names, honorifics, and `Last, First`,
+    tagged `[NAME]`. Common document / org words (months, states,
+    Bank, Insurance, Statement, Internal Revenue Service, …) are
+    allowlisted so category signal survives.
   * Dates of birth labeled with `DOB`, `D.O.B.`, `date of birth`,
     `birthdate`, `birthday`, or `born on …`.
 * **Nothing sensitive is ever logged.** The gate reports counts and
@@ -288,7 +314,7 @@ transmit anything that still matches an ID pattern.
    ```
 
    Review `/mnt/nas/scans/_logs/manifest-*.jsonl` and the generated
-   `summary-YYYY-MM-DD.md`.
+   `summary-<UTC timestamp>.md`.
 
 6. Real run:
 
@@ -386,6 +412,17 @@ The test suite covers:
   spaced / near-keyword, EIN, long account digits, Luhn-valid card,
   spaced/dashed routing, DOB variants), Luhn checksum, and the
   `assert_safe_for_outbound` defensive guard.
+- `tests/test_identity_redaction.py` — card fragments, US addresses,
+  Title-Case names, allowlist, and the two dry-run leak shapes
+  (`Zebulon Quill` + `card ending 0000`; names + `123 Fakeville Rd…`).
+- `tests/test_local_only_categories.py` — `LOCAL_ONLY_CATEGORIES` default
+  and override; Finance-Bank / ID-Legal / Medical stay on-host.
+- `tests/test_summary_stamp.py` — `summary-<UTC timestamp>.md` never
+  overwrites a sibling run.
+- `tests/test_gemini_retry.py` — `GEMINI_MODEL`, 503/429 backoff,
+  ProviderError logs status+body (not the prompt), `--provider-probe`.
+- `tests/test_print_prompts.py` — `--print-prompts` requires `--dry-run`,
+  writes mode-0600 JSONL, and never calls `urlopen`.
 - `tests/test_outbound_privacy.py` — Anthropic and Gemini providers are
   mocked and the test asserts that no SSN, EIN, account, card, DOB, or
   private‑term value ever appears in the outbound prompt, logs, or

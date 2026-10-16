@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -39,10 +40,17 @@ log = logging.getLogger(__name__)
 
 # Owner rule: never default to the newest, most expensive frontier tier.
 # Anthropic: the original Haiku 3 is the cheapest hosted tier and never
-# auto-upgrades. Gemini: 2.0 Flash is the oldest supported Flash tier at
-# the time of writing, and it is explicitly older than 2.5 Flash.
+# auto-upgrades. Gemini 2.0 Flash was shut down on 2026-06-01, so the
+# cheapest Flash tier still served is 2.5 Flash. Override with GEMINI_MODEL
+# (or SCAN_GEMINI_MODEL / SCAN_MODEL / --model).
 DEFAULT_ANTHROPIC_MODEL = "claude-3-haiku-20240307"
-DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+
+# Retry transient Gemini capacity / rate-limit failures. "Up to 3 times"
+# means 3 retries after the first failure (4 attempts total).
+GEMINI_RETRY_STATUSES = frozenset({429, 503})
+GEMINI_MAX_RETRIES = 3
+GEMINI_BACKOFF_S = 1.0
 
 
 class ProviderError(RuntimeError):
@@ -126,10 +134,24 @@ def _resolve_anthropic_model(settings: ClassifierSettings) -> str:
 def _resolve_gemini_model(settings: ClassifierSettings) -> str:
     return (
         settings.model
+        or os.environ.get("GEMINI_MODEL")
         or os.environ.get("SCAN_GEMINI_MODEL")
         or os.environ.get("SCAN_MODEL")
         or DEFAULT_GEMINI_MODEL
     )
+
+
+def _read_http_error_body(exc: urllib.error.HTTPError) -> str:
+    """Return the provider error body. Never include the request prompt."""
+    try:
+        raw = exc.read()
+    except Exception:
+        return ""
+    if not raw:
+        return ""
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="replace")
+    return str(raw)
 
 
 def _call_anthropic(
@@ -191,27 +213,91 @@ def _call_gemini(
             "responseMimeType": "application/json",
         },
     }
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "x-goog-api-key": api_key,
-        },
-        method="POST",
-    )
     assert_safe_for_outbound(prompt, terms)
-    try:
-        with urllib.request.urlopen(req, timeout=settings.timeout_s) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raise ProviderError(f"Gemini HTTP {exc.code}") from exc
-    except Exception as exc:
-        raise ProviderError(f"Gemini call failed: {exc}") from exc
+    last_status: Optional[int] = None
+    last_body = ""
+    result: Optional[Dict[str, object]] = None
+    for attempt in range(GEMINI_MAX_RETRIES + 1):
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=settings.timeout_s) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as exc:
+            last_status = exc.code
+            last_body = _read_http_error_body(exc)
+            log.error(
+                "Gemini HTTP %s (attempt %s/%s) body=%s",
+                exc.code,
+                attempt + 1,
+                GEMINI_MAX_RETRIES + 1,
+                last_body,
+            )
+            if exc.code in GEMINI_RETRY_STATUSES and attempt < GEMINI_MAX_RETRIES:
+                time.sleep(GEMINI_BACKOFF_S * (2 ** attempt))
+                continue
+            raise ProviderError(f"Gemini HTTP {exc.code}: {last_body}") from exc
+        except Exception as exc:
+            raise ProviderError(f"Gemini call failed: {exc}") from exc
+    else:
+        raise ProviderError(f"Gemini HTTP {last_status}: {last_body}")
     try:
         return result["candidates"][0]["content"]["parts"][0]["text"]
     except (KeyError, IndexError, TypeError) as exc:
         raise ProviderError(f"Unexpected Gemini payload shape") from exc
+
+
+def provider_probe(settings: ClassifierSettings) -> Dict[str, object]:
+    """Send a content-free ``ping`` and report HTTP status. No document text."""
+    ping = "ping"
+    assert_safe_for_outbound(ping)
+    model = ""
+    try:
+        if settings.provider == "local-keyword":
+            return {
+                "ok": True,
+                "provider": "local-keyword",
+                "model": "",
+                "status": 0,
+                "detail": "local-keyword makes no network calls",
+            }
+        if settings.provider == "gemini":
+            model = _resolve_gemini_model(settings)
+            _call_gemini(ping, settings)
+            return {"ok": True, "provider": "gemini", "model": model, "status": 200}
+        if settings.provider == "anthropic":
+            model = _resolve_anthropic_model(settings)
+            _call_anthropic(ping, settings)
+            return {"ok": True, "provider": "anthropic", "model": model, "status": 200}
+        raise ProviderError(f"Unknown provider: {settings.provider}")
+    except ProviderError as exc:
+        status = None
+        message = str(exc)
+        match = re.search(r"HTTP (\d{3})", message)
+        if match:
+            status = int(match.group(1))
+        log.error(
+            "Provider probe failed: provider=%s model=%s status=%s error=%s",
+            settings.provider,
+            model,
+            status,
+            message,
+        )
+        return {
+            "ok": False,
+            "provider": settings.provider,
+            "model": model,
+            "status": status,
+            "detail": message,
+        }
 
 
 def _labels_contain_private_term(
