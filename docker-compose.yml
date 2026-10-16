@@ -33,6 +33,8 @@ services:
       SCANS_ROOT: /scans
       SCAN_PROVIDER: ${SCAN_PROVIDER:-local-keyword}
       SCAN_MODEL: ${SCAN_MODEL:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-}
+      LOCAL_ONLY_CATEGORIES: ${LOCAL_ONLY_CATEGORIES:-Finance-Bank,ID-Legal,Medical}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       TZ: ${TZ:-UTC}

@@ -72,10 +72,19 @@ def test_evaluate_blocks_outbound_and_reports_count_only():
 
 def test_evaluate_allows_benign_text():
     terms = SensitiveTerms.load(path=None, include_builtins=True)
-    text = "Electric company monthly statement for 12 Main Street."
+    text = "Electric company monthly statement. Amount due $40.00."
     decision = evaluate(text, terms)
     assert decision.outbound_ok is True
     assert decision.scrubbed_text == text
+
+
+def test_evaluate_redacts_address_but_still_allows_outbound():
+    terms = SensitiveTerms.load(path=None, include_builtins=True)
+    text = "Electric company monthly statement for 12 Main Street."
+    decision = evaluate(text, terms)
+    assert decision.outbound_ok is True
+    assert "12 Main Street" not in decision.scrubbed_text
+    assert "[ADDRESS]" in decision.scrubbed_text
 
 
 def test_gate_classifies_as_sensitive_on_residual_pii_only(monkeypatch):

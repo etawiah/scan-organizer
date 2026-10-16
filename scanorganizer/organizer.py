@@ -1,23 +1,31 @@
 """Batch orchestration: process_file, process_batch, refile_folder."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Dict, Iterable, List, Optional, Set, TextIO
 
 from . import classifier as classifier_mod
 from . import ocr as ocr_mod
 from .classifier import ClassifierSettings
-from .config import REVIEW_ONLY_EXTS
+from .config import REVIEW_ONLY_EXTS, is_local_only_category
 from .dates import resolve_doc_date
 from .hashing import sha256_file
 from .manifest import ManifestEntry, ManifestWriter, seen_hashes
 from .naming import build_dest_path, build_filename, disambiguate, sanitize_short_name
-from .privacy import RedactionReport, SensitiveTerms, gate
+from .privacy import (
+    RedactionReport,
+    SensitiveTerms,
+    assert_safe_for_outbound,
+    gate,
+    sanitize_outbound_label,
+)
 from .scanner import CandidateFile, walk_inbox
 from .taxonomy import Taxonomy, TaxonomyError, TaxonomyNode
 
@@ -39,6 +47,9 @@ class RunConfig:
     recursive: bool = False
     ocr_pages: int = 5
     hash_skip_dirs: Set[Path] = field(default_factory=set)
+    run_stamp: str = ""
+    print_prompts: bool = False
+    prompts_path: Optional[Path] = None
 
 
 @dataclass
@@ -72,12 +83,51 @@ def _ocr_or_empty(path: Path, max_pages: int) -> str:
         return ""
 
 
+class PromptDumpWriter:
+    """Append-only JSONL writer for ``--print-prompts`` (mode 0600)."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._fh: Optional[TextIO] = None
+        self._fd: Optional[int] = None
+
+    def __enter__(self) -> "PromptDumpWriter":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        self._fd = os.open(self.path, flags, 0o600)
+        try:
+            os.fchmod(self._fd, 0o600)
+        except OSError:
+            pass
+        self._fh = os.fdopen(self._fd, "w", encoding="utf-8")
+        self._fd = None
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._fh:
+            self._fh.flush()
+            try:
+                os.fsync(self._fh.fileno())
+            except OSError:
+                pass
+            self._fh.close()
+            self._fh = None
+
+    def write(self, record: Dict[str, object]) -> None:
+        if not self._fh:
+            raise RuntimeError("PromptDumpWriter not opened")
+        self._fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self._fh.flush()
+
+
 def _classify_file(
     text: str,
     file_path: Path,
     taxonomy: Taxonomy,
     settings: ClassifierSettings,
     sensitive_terms: SensitiveTerms,
+    print_prompts: bool = False,
+    prompts_writer: Optional[PromptDumpWriter] = None,
 ) -> Dict[str, object]:
     """Single redaction gate shared by every provider path.
 
@@ -105,15 +155,40 @@ def _classify_file(
         report.category_counts["private_term"] = (
             report.category_counts.get("private_term", 0) + label_hits
         )
-    if report.sensitive:
-        from . import local_rules
-        result = local_rules.classify(text, taxonomy, file_path.name)
+    from . import local_rules
+    local_guess = local_rules.classify(text, taxonomy, file_path.name)
+    category_blocked = is_local_only_category(str(local_guess.get("doc_type") or ""))
+    if report.sensitive or category_blocked:
+        result = local_guess
         result["provider"] = "local-keyword"
-        result["privacy"] = "local-only: sensitive"
+        result["privacy"] = (
+            "local-only: sensitive" if report.sensitive else "local-only: category"
+        )
         result["privacy_blocked"] = True
         result["privacy_report"] = report.summary_for_manifest()
         return result
     scrubbed = report.scrubbed_text or ""
+    if print_prompts:
+        safe_name = sanitize_outbound_label(file_path.name, sensitive_terms)
+        raw_path = str(file_path)
+        safe_path = sanitize_outbound_label(raw_path, sensitive_terms) if raw_path else ""
+        if safe_path == safe_name:
+            safe_path = ""
+        prompt = classifier_mod._build_prompt(
+            taxonomy, scrubbed, filename=safe_name, path=safe_path,
+        )
+        assert_safe_for_outbound(prompt, sensitive_terms)
+        if prompts_writer is not None:
+            prompts_writer.write({
+                "src": str(file_path),
+                "filename": safe_name,
+                "prompt": prompt,
+            })
+        result = local_guess
+        result["provider"] = "local-keyword"
+        result["print_prompts"] = True
+        result["privacy_report"] = report.summary_for_manifest()
+        return result
     out = classifier_mod.classify(
         scrubbed,
         file_path.name,
@@ -169,6 +244,7 @@ def process_file(
     cfg: RunConfig,
     writer: ManifestWriter,
     known_hashes: Dict[str, Path],
+    prompts_writer: Optional[PromptDumpWriter] = None,
 ) -> FileOutcome:
     file_path = candidate.path
     try:
@@ -217,6 +293,8 @@ def process_file(
     try:
         classification = _classify_file(
             text, file_path, cfg.taxonomy, cfg.settings, cfg.sensitive_terms,
+            print_prompts=bool(cfg.print_prompts),
+            prompts_writer=prompts_writer,
         )
     except Exception as exc:
         log.exception("Classifier threw unexpectedly for %s", file_path)
@@ -282,12 +360,19 @@ def process_batch(cfg: RunConfig) -> BatchResult:
 
     result = BatchResult()
     processed = 0
-    with ManifestWriter(cfg.manifest_path) as writer:
+    prompts_ctx = (
+        PromptDumpWriter(cfg.prompts_path)
+        if cfg.print_prompts and cfg.prompts_path
+        else nullcontext()
+    )
+    with ManifestWriter(cfg.manifest_path) as writer, prompts_ctx as prompts_writer:
         for candidate in walk_inbox(cfg.src, recursive=cfg.recursive, skip_dirs=skip_dirs):
             if cfg.limit and processed >= cfg.limit:
                 break
             try:
-                outcome = process_file(candidate, cfg, writer, known)
+                outcome = process_file(
+                    candidate, cfg, writer, known, prompts_writer=prompts_writer,
+                )
             except Exception as exc:
                 log.exception("Unhandled error on %s", candidate.path)
                 outcome = FileOutcome(
@@ -329,7 +414,12 @@ def refile_folders(
 
     result = BatchResult()
     processed = 0
-    with ManifestWriter(cfg.manifest_path) as writer:
+    prompts_ctx = (
+        PromptDumpWriter(cfg.prompts_path)
+        if cfg.print_prompts and cfg.prompts_path
+        else nullcontext()
+    )
+    with ManifestWriter(cfg.manifest_path) as writer, prompts_ctx as prompts_writer:
         for root in legacy_roots:
             root = Path(root)
             if not root.exists():
@@ -339,7 +429,9 @@ def refile_folders(
                 if cfg.limit and processed >= cfg.limit:
                     break
                 try:
-                    outcome = process_file(candidate, cfg, writer, known)
+                    outcome = process_file(
+                        candidate, cfg, writer, known, prompts_writer=prompts_writer,
+                    )
                 except Exception as exc:
                     log.exception("Unhandled error during refile on %s", candidate.path)
                     outcome = FileOutcome(
