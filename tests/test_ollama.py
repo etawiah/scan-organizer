@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -9,10 +11,17 @@ import pytest
 from scanorganizer import classifier as classifier_mod
 from scanorganizer import ocr as ocr_mod
 from scanorganizer.classifier import (
+    DEFAULT_OLLAMA_MODEL,
+    DEFAULT_OLLAMA_TIMEOUT_S,
     DEFAULT_OLLAMA_URL,
+    MIN_OLLAMA_TIMEOUT_S,
+    OLLAMA_OCR_CHAR_CAP,
     CloudCallBudget,
     ClassifierSettings,
     OllamaURLError,
+    _resolve_ollama_model,
+    _resolve_ollama_timeout,
+    cap_ollama_ocr_text,
     classify,
     resolve_ollama_url,
     validate_ollama_url,
@@ -83,6 +92,7 @@ def _ok_generate(text: str | None = None):
         "http://[::1]:11434",
         "http://10.0.0.5:11434",
         "http://192.168.1.10",
+        "http://192.168.3.10:11434",
         "http://172.16.0.1:11434",
         "http://172.31.255.1",
         "https://192.168.0.2:11434",
@@ -122,6 +132,29 @@ def test_default_ollama_url_is_localhost(monkeypatch):
     assert DEFAULT_OLLAMA_URL == "http://localhost:11434"
 
 
+def test_default_ollama_model_is_qwen(monkeypatch):
+    monkeypatch.delenv("OLLAMA_MODEL", raising=False)
+    monkeypatch.delenv("SCAN_MODEL", raising=False)
+    assert DEFAULT_OLLAMA_MODEL == "qwen2.5:7b-instruct"
+    assert _resolve_ollama_model(ClassifierSettings(provider="ollama")) == (
+        "qwen2.5:7b-instruct"
+    )
+
+
+def test_ollama_timeout_default_180_floor_120(monkeypatch):
+    monkeypatch.delenv("OLLAMA_TIMEOUT", raising=False)
+    assert DEFAULT_OLLAMA_TIMEOUT_S == 180
+    assert MIN_OLLAMA_TIMEOUT_S == 120
+    assert _resolve_ollama_timeout(ClassifierSettings(provider="ollama")) == 180
+    monkeypatch.setenv("OLLAMA_TIMEOUT", "60")
+    assert _resolve_ollama_timeout(ClassifierSettings(provider="ollama")) == 120
+    monkeypatch.setenv("OLLAMA_TIMEOUT", "240")
+    assert _resolve_ollama_timeout(ClassifierSettings(provider="ollama")) == 240
+    assert _resolve_ollama_timeout(
+        ClassifierSettings(provider="ollama", ollama_timeout_s=30)
+    ) == 120
+
+
 def test_ollama_is_local_provider():
     assert is_local_provider("ollama")
     assert is_local_provider("local-keyword")
@@ -150,14 +183,15 @@ def test_ollama_sends_full_redacted_ocr_and_skips_allowlist(
     monkeypatch, taxonomy,
 ):
     monkeypatch.setenv("OLLAMA_URL", "http://127.0.0.1:11434")
-    monkeypatch.setenv("OLLAMA_MODEL", "llama3.2")
+    monkeypatch.delenv("OLLAMA_MODEL", raising=False)
+    monkeypatch.delenv("SCAN_MODEL", raising=False)
     captured = []
 
     def fake_urlopen(req, timeout=None):
         captured.append(req)
         body = json.loads(req.data.decode("utf-8"))
         assert body["format"] == "json"
-        assert body["model"] == "llama3.2"
+        assert body["model"] == "qwen2.5:7b-instruct"
         assert body["stream"] is False
         return _ok_chat()
 
@@ -274,3 +308,68 @@ def test_ollama_local_only_category_still_short_circuits(
     assert result.outcomes
     assert result.outcomes[0].provider == "local-keyword"
     assert result.outcomes[0].classification.get("privacy_blocked") is True
+
+
+def test_ollama_ocr_capped_at_about_2500_tokens(monkeypatch, taxonomy):
+    monkeypatch.setenv("OLLAMA_URL", "http://192.168.3.10:11434")
+    captured = []
+
+    def fake_urlopen(req, timeout=None):
+        captured.append(json.loads(req.data.decode("utf-8")))
+        return _ok_chat()
+
+    monkeypatch.setattr(classifier_mod.urllib.request, "urlopen", fake_urlopen)
+    long_ocr = (
+        "INVOICE HEADER START " + ("lorem " * 4000) + " UNIQUE_TAIL_MARKER_SHOULD_BE_DROPPED"
+    )
+    assert len(long_ocr) > OLLAMA_OCR_CHAR_CAP
+    settings = ClassifierSettings(provider="ollama")
+    result = classify(long_ocr, "long.pdf", taxonomy, settings, local_ocr_text=long_ocr)
+    assert result["provider"] == "ollama"
+    prompt = captured[0]["messages"][0]["content"]
+    capped = cap_ollama_ocr_text(long_ocr)
+    assert len(capped) == OLLAMA_OCR_CHAR_CAP
+    assert capped in prompt
+    assert long_ocr not in prompt
+    assert "INVOICE HEADER START" in prompt
+    assert "UNIQUE_TAIL_MARKER_SHOULD_BE_DROPPED" not in prompt
+
+
+def test_ollama_requests_are_strictly_sequential(monkeypatch, taxonomy):
+    monkeypatch.setenv("OLLAMA_URL", "http://192.168.3.20:11434")
+    state = {"active": 0, "max_active": 0}
+    barrier = threading.Lock()
+
+    def fake_urlopen(req, timeout=None):
+        with barrier:
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+        time.sleep(0.05)
+        with barrier:
+            state["active"] -= 1
+        return _ok_chat()
+
+    monkeypatch.setattr(classifier_mod.urllib.request, "urlopen", fake_urlopen)
+    settings = ClassifierSettings(provider="ollama")
+
+    def _run():
+        classify(CLEAN_BILL, "bill.pdf", taxonomy, settings)
+
+    threads = [
+        threading.Thread(target=_run),
+        threading.Thread(target=_run),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert state["max_active"] == 1
+
+
+def test_env_example_uses_lan_placeholder():
+    text = Path(__file__).resolve().parent.parent.joinpath(".env.example").read_text(
+        encoding="utf-8",
+    )
+    assert "# OLLAMA_URL=http://192.168.x.x:11434" in text
+    assert "# OLLAMA_MODEL=qwen2.5:7b-instruct" in text
+    assert "llama3.2" not in text

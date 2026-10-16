@@ -16,9 +16,9 @@
 #   SCAN_MODEL              Optional model id override
 #   ANTHROPIC_API_KEY       Required when SCAN_PROVIDER=anthropic
 #   GEMINI_API_KEY          Required when SCAN_PROVIDER=gemini
-#   OLLAMA_URL              Local/LAN Ollama base URL (localhost or RFC1918)
-#   OLLAMA_MODEL            Ollama model id (default llama3.2)
-#   OLLAMA_TIMEOUT          Seconds (default 60)
+#   OLLAMA_URL              LAN Ollama URL (localhost or RFC1918; e.g. 192.168.3.x)
+#   OLLAMA_MODEL            Ollama model id (default qwen2.5:7b-instruct)
+#   OLLAMA_TIMEOUT          Seconds (default 180, minimum 120; one request at a time)
 #   SCAN_UID_GID            Container user:group (default 1033:100)
 #
 # Minimal weekly run (dry-run):

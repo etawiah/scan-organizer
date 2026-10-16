@@ -39,15 +39,19 @@ reachable, plus:
   The Anthropic and Gemini defaults are deliberately cheap hosted tiers
   (`claude-3-haiku-20240307` and `gemini-2.5-flash-lite`). Gemini 2.0
   Flash shut down in June 2026. Keyword-only Gemini is a poor fit for
-  this corpus, so `--provider ollama` talks to a **local** model
-  (`SCAN_PROVIDER=ollama`, `OLLAMA_URL` default
-  `http://localhost:11434`, `OLLAMA_MODEL`, `OLLAMA_TIMEOUT`). Ollama
-  is marked `is_local=True`: it receives the full redacted-by-private-terms
-  OCR (not the cloud allowlist) and does not count against
-  `--max-cloud-calls`. `OLLAMA_URL` is refused unless the host is
-  `localhost` or an RFC1918/LAN address, so a mis-set URL cannot leak
-  to a remote host. Private-term hits and kids' / `LOCAL_ONLY_CATEGORIES`
-  routing still short-circuit to `local-keyword` exactly as before.
+  this corpus, so `--provider ollama` talks to a **local** model on
+  the LAN (`SCAN_PROVIDER=ollama`, `OLLAMA_URL` default
+  `http://localhost:11434`, deploy on `192.168.3.x`,
+  `OLLAMA_MODEL` default `qwen2.5:7b-instruct`, `OLLAMA_TIMEOUT`
+  default 180s / minimum 120s). The host handles **one request at a
+  time**; calls are serialized and the OCR text sent per file is
+  capped at about 2500 tokens (~10k characters). Ollama is marked
+  `is_local=True`: it receives the redacted-by-private-terms OCR (not
+  the cloud allowlist) and does not count against `--max-cloud-calls`.
+  `OLLAMA_URL` is refused unless the host is `localhost` or an
+  RFC1918/LAN address, so a mis-set URL cannot leak to a remote host.
+  Private-term hits and kids' / `LOCAL_ONLY_CATEGORIES` routing still
+  short-circuit to `local-keyword` exactly as before.
 - A **single local redaction gate** runs before any outbound call. It
   guarantees that no children's PII — and no SSN, EIN, routing, account,
   or card number — ever reaches a frontier model. Any private-term hit
@@ -138,8 +142,9 @@ For each file in `--src`:
    is `Finance-Bank`, `ID-Legal`, or `Medical` stay local-only;
    override with `LOCAL_ONLY_CATEGORIES`. The **ollama** provider is
    local (`is_local=True`) so the allowlist gate does not apply: it
-   receives the full redacted-by-private-terms OCR. Private-term and
-   kids' local-only routing is unchanged.
+   receives the redacted-by-private-terms OCR, capped at ~2500 tokens
+   (~10k characters), one file at a time. Private-term and kids'
+   local-only routing is unchanged.
 6. The result is validated against `taxonomy.yaml` after the path is
    normalized (trim, collapse blank or repeated segments,
    case-insensitive).
@@ -243,10 +248,13 @@ Environment variables honored:
 - `ANTHROPIC_API_KEY` — required when `--provider anthropic`.
 - `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) — required when `--provider gemini`.
 - `OLLAMA_URL` — Ollama base URL (default `http://localhost:11434`).
-  Host must be `localhost` or an RFC1918/LAN address; anything else
-  is refused.
-- `OLLAMA_MODEL` — Ollama model id (default `llama3.2`).
-- `OLLAMA_TIMEOUT` — seconds (default `60`).
+  Host must be `localhost` or an RFC1918/LAN address (the live
+  daemon is on `192.168.3.x`); anything else is refused. Example in
+  [`.env.example`](.env.example): `http://192.168.x.x:11434`.
+- `OLLAMA_MODEL` — Ollama model id (default `qwen2.5:7b-instruct`).
+- `OLLAMA_TIMEOUT` — seconds (default `180`, minimum `120`). The
+  model handles one request at a time; OCR text is capped at ~2500
+  tokens (~10k characters) per file.
 
 Copy [`.env.example`](.env.example) to `.env` (git‑ignored) and fill the
 values in locally; or set these variables in

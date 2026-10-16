@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -50,8 +51,15 @@ log = logging.getLogger(__name__)
 DEFAULT_ANTHROPIC_MODEL = "claude-3-haiku-20240307"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
-DEFAULT_OLLAMA_MODEL = "llama3.2"
-DEFAULT_OLLAMA_TIMEOUT_S = 60
+# Deployment: LAN 192.168.3.x runs qwen2.5:7b-instruct, one request at a time.
+DEFAULT_OLLAMA_MODEL = "qwen2.5:7b-instruct"
+DEFAULT_OLLAMA_TIMEOUT_S = 180
+MIN_OLLAMA_TIMEOUT_S = 120
+# ~2500 tokens ≈ 4 chars/token. Head of the page is kept (letterhead / title).
+OLLAMA_OCR_TOKEN_CAP = 2500
+OLLAMA_OCR_CHAR_CAP = 10_000
+
+_OLLAMA_LOCK = threading.Lock()
 
 # Literal hosts plus RFC1918 / loopback. Remote hostnames are refused so a
 # mis-set OLLAMA_URL cannot leak redacted OCR off the LAN.
@@ -177,10 +185,20 @@ rather than guessing the caller will route low confidence documents for human re
 """
 
 
+def cap_ollama_ocr_text(text: str, limit: int = OLLAMA_OCR_CHAR_CAP) -> str:
+    """Keep at most ``limit`` characters (~2500 tokens) of redacted OCR."""
+    body = text if text is not None else ""
+    if limit <= 0:
+        return ""
+    if len(body) <= limit:
+        return body
+    return body[:limit]
+
+
 def _build_local_prompt(taxonomy: Taxonomy, scrubbed_ocr: str) -> str:
     """Full-text prompt for a local model. Uses already-redacted OCR."""
     allowed = taxonomy.describe_for_prompt()
-    body = scrubbed_ocr if scrubbed_ocr is not None else ""
+    body = cap_ollama_ocr_text(scrubbed_ocr if scrubbed_ocr is not None else "")
     return f"""You are classifying scanned household business documents into a strict taxonomy.
 
 ALLOWED taxonomy nodes owner area doc_type. You must pick EXACTLY one.
@@ -333,15 +351,20 @@ def _resolve_ollama_model(settings: ClassifierSettings) -> str:
 
 
 def _resolve_ollama_timeout(settings: ClassifierSettings) -> int:
+    """Seconds. Floor is 120; default is 180 (qwen2.5:7b is one-at-a-time)."""
+    resolved: Optional[int] = None
     if settings.ollama_timeout_s is not None:
-        return max(1, int(settings.ollama_timeout_s))
-    raw = os.environ.get("OLLAMA_TIMEOUT")
-    if raw is not None and str(raw).strip() != "":
-        try:
-            return max(1, int(str(raw).strip()))
-        except ValueError:
-            return DEFAULT_OLLAMA_TIMEOUT_S
-    return DEFAULT_OLLAMA_TIMEOUT_S
+        resolved = max(1, int(settings.ollama_timeout_s))
+    else:
+        raw = os.environ.get("OLLAMA_TIMEOUT")
+        if raw is not None and str(raw).strip() != "":
+            try:
+                resolved = max(1, int(str(raw).strip()))
+            except ValueError:
+                resolved = DEFAULT_OLLAMA_TIMEOUT_S
+    if resolved is None:
+        resolved = DEFAULT_OLLAMA_TIMEOUT_S
+    return max(MIN_OLLAMA_TIMEOUT_S, resolved)
 
 
 def _ollama_post(url: str, body: Dict[str, object], timeout: int) -> Dict[str, object]:
@@ -358,7 +381,16 @@ def _ollama_post(url: str, body: Dict[str, object], timeout: int) -> Dict[str, o
 
 
 def _call_ollama(prompt: str, settings: ClassifierSettings) -> str:
-    """Call a LAN Ollama daemon. Tries ``/api/chat`` then ``/api/generate``."""
+    """Call a LAN Ollama daemon. Tries ``/api/chat`` then ``/api/generate``.
+
+    The host model handles one request at a time, so every call takes a
+    process-wide lock and the batch loop never overlaps requests.
+    """
+    with _OLLAMA_LOCK:
+        return _call_ollama_locked(prompt, settings)
+
+
+def _call_ollama_locked(prompt: str, settings: ClassifierSettings) -> str:
     base = resolve_ollama_url(settings.ollama_url)
     model = _resolve_ollama_model(settings)
     timeout = _resolve_ollama_timeout(settings)
