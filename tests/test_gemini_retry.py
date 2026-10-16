@@ -55,7 +55,7 @@ def test_default_and_gemini_model_env(monkeypatch):
     monkeypatch.delenv("SCAN_MODEL", raising=False)
     settings = ClassifierSettings(provider="gemini")
     assert _resolve_gemini_model(settings) == DEFAULT_GEMINI_MODEL
-    assert DEFAULT_GEMINI_MODEL == "gemini-2.5-flash"
+    assert DEFAULT_GEMINI_MODEL == "gemini-2.5-flash-lite"
 
     monkeypatch.setenv("GEMINI_MODEL", "gemini-custom-flash")
     assert _resolve_gemini_model(settings) == "gemini-custom-flash"

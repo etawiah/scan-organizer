@@ -37,8 +37,8 @@ reachable, plus:
   — never in a brand‑new folder.
 - Classifier choice: `--provider anthropic|gemini|local-keyword`. The
   Anthropic and Gemini defaults are deliberately cheap hosted tiers
-  (`claude-3-haiku-20240307` and `gemini-2.5-flash`). Gemini 2.0 Flash
-  shut down in June 2026.
+  (`claude-3-haiku-20240307` and `gemini-2.5-flash-lite`). Gemini 2.0
+  Flash shut down in June 2026.
 - A **single local redaction gate** runs before any outbound call. It
   guarantees that no children's PII — and no SSN, EIN, routing, account,
   or card number — ever reaches a frontier model. Any private-term hit
@@ -71,10 +71,12 @@ For each file in `--src`:
 2. `.docx` and other review‑only formats go straight to `_Review/`.
 3. OCR up to `--ocr-pages` pages (default `5`). Empty text → `_Unsorted/`.
 4. The **redaction gate** processes the OCR text:
-   * Private terms from `config/private_terms.txt` (whole-word,
-     case-insensitive, both `First Last` and `Last, First` orders) are
-     counted and replaced with `[REDACTED_TERM]`. Any hit flips the
-     document to `local-only: sensitive`.
+   * Private terms from `config/private_terms.txt` or `PRIVATE_TERMS`
+     (whole-word, case-insensitive including ALL CAPS, `First Last` /
+     `Last, First`, and lone given-name tokens; `_` / `-` count as
+     boundaries in filenames and paths) are counted and replaced with
+     `[REDACTED_TERM]`. Any hit flips the document to
+     `local-only: sensitive`.
    * SSNs (`123-45-6789`, spaced, and 9-digit unformatted near SSN
      keywords), EINs (`##-#######`), account/routing numbers (digit runs
      of 8+ allowing spaces/dashes), payment cards (Luhn-valid 13–19 digit
@@ -180,8 +182,11 @@ Environment variables honored:
 - `SCAN_ANTHROPIC_MODEL` — override for the Anthropic model.
   Defaults to `claude-3-haiku-20240307` (older, cheap Haiku tier).
 - `GEMINI_MODEL` / `SCAN_GEMINI_MODEL` — override for the Gemini model.
-  Defaults to `gemini-2.5-flash` (cheap Flash tier; 2.0 is no longer
-  served). `GEMINI_MODEL` wins.
+  Defaults to `gemini-2.5-flash-lite` (oldest cheap Flash still listed
+  as live; 2.0 is shut down). `GEMINI_MODEL` wins.
+- `PRIVATE_TERMS` / `SCAN_PRIVATE_TERMS` — extra private terms (comma or
+  newline separated). Same matching as the gitignored
+  `private_terms.txt`. Never commit real names.
 - `LOCAL_ONLY_CATEGORIES` — comma-separated doc_types that stay
   on-host (default `Finance-Bank,ID-Legal,Medical`). Empty disables.
 - `ANTHROPIC_API_KEY` — required when `--provider anthropic`.
@@ -217,12 +222,16 @@ Legacy `private_terms.txt` in the repo root is still honored for backward
 compatibility; the new `config/private_terms.txt` location takes
 precedence when both exist.
 
-Every line is a term. Matching is case‑insensitive with whole‑word
-boundaries. Two‑word names are automatically also matched in
-`Last, First` order. Blank lines and `# comments` are ignored. Common
-minor/medical keywords (`school`, `pediatric`, `report card`,
-`immunization`, `DOB`, `IEP`, …) are built in and don't need to be
-repeated.
+Every line is a term. Matching is case‑insensitive (including ALL
+CAPS) with whole‑word boundaries; `_` and `-` are boundaries so
+`ZEBULON_scan.pdf` matches. Two‑word names are also matched in
+`Last, First` order **and** as the lone given name (`Zebulon Quill`
+also catches `ZEBULON` / `zebulon` alone). Blank lines and
+`# comments` are ignored. You can also pass terms via the
+`PRIVATE_TERMS` env var (comma or newline separated) so nothing
+sensitive has to live in git. Common minor/medical keywords
+(`school`, `pediatric`, `report card`, `immunization`, `DOB`,
+`IEP`, …) are built in and don't need to be repeated.
 
 ### Owner rule — enforced by code
 

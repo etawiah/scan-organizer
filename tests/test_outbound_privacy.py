@@ -76,9 +76,9 @@ def _write(path: Path, body: str) -> None:
 
 def test_default_models_are_cheap_flash_tiers():
     assert DEFAULT_ANTHROPIC_MODEL == "claude-3-haiku-20240307"
-    # gemini-2.0-flash shut down 2026-06-01; default is the cheap Flash tier
-    # still served (2.5), never a Pro / Ultra / thinking frontier id.
-    assert DEFAULT_GEMINI_MODEL == "gemini-2.5-flash"
+    # gemini-2.0-flash shut down 2026-06-01; default is the cheapest live
+    # Flash still listed (2.5-flash-lite), never a Pro / Ultra id.
+    assert DEFAULT_GEMINI_MODEL == "gemini-2.5-flash-lite"
     for forbidden in ("sonnet", "opus", "pro", "ultra"):
         assert forbidden not in DEFAULT_ANTHROPIC_MODEL.lower()
         assert forbidden not in DEFAULT_GEMINI_MODEL.lower()
