@@ -22,7 +22,11 @@ def main() -> int:
     print("\nTesting API connection...")
 
     request_body = {
-        "model": os.environ.get("SCAN_MODEL", "claude-sonnet-4-20250514"),
+        "model": (
+            os.environ.get("SCAN_ANTHROPIC_MODEL")
+            or os.environ.get("SCAN_MODEL")
+            or "claude-3-haiku-20240307"
+        ),
         "max_tokens": 100,
         "messages": [{"role": "user", "content": "Say hello in one word"}],
     }

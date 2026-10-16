@@ -13,6 +13,11 @@ A provider accepts (text, filename) and returns a dict shaped like:
 
 Values that fail to parse / don't validate against the taxonomy are the
 caller's problem. The caller demotes them to _Review/.
+
+Every outbound HTTP call in this module runs
+:func:`scanorganizer.privacy.assert_safe_for_outbound` on the prompt right
+before it goes on the wire, as a defense in depth against anyone who
+bypasses the ``privacy.gate`` entry point in future code.
 """
 from __future__ import annotations
 
@@ -26,9 +31,18 @@ from dataclasses import dataclass
 from typing import Dict, Optional
 
 from . import local_rules
+from .privacy import assert_safe_for_outbound
 from .taxonomy import Taxonomy
 
 log = logging.getLogger(__name__)
+
+
+# Owner rule: never default to the newest, most expensive frontier tier.
+# Anthropic: the original Haiku 3 is the cheapest hosted tier and never
+# auto-upgrades. Gemini: 2.0 Flash is the oldest supported Flash tier at
+# the time of writing, and it is explicitly older than 2.5 Flash.
+DEFAULT_ANTHROPIC_MODEL = "claude-3-haiku-20240307"
+DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
 
 
 class ProviderError(RuntimeError):
@@ -91,11 +105,30 @@ class ClassifierSettings:
     max_tokens: int = 400
 
 
+def _resolve_anthropic_model(settings: ClassifierSettings) -> str:
+    return (
+        settings.model
+        or os.environ.get("SCAN_ANTHROPIC_MODEL")
+        or os.environ.get("SCAN_MODEL")
+        or DEFAULT_ANTHROPIC_MODEL
+    )
+
+
+def _resolve_gemini_model(settings: ClassifierSettings) -> str:
+    return (
+        settings.model
+        or os.environ.get("SCAN_GEMINI_MODEL")
+        or os.environ.get("SCAN_MODEL")
+        or DEFAULT_GEMINI_MODEL
+    )
+
+
 def _call_anthropic(prompt: str, settings: ClassifierSettings) -> str:
+    assert_safe_for_outbound(prompt)
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise ProviderError("ANTHROPIC_API_KEY not set")
-    model = settings.model or "claude-sonnet-4-20250514"
+    model = _resolve_anthropic_model(settings)
     body = {
         "model": model,
         "max_tokens": settings.max_tokens,
@@ -121,14 +154,15 @@ def _call_anthropic(prompt: str, settings: ClassifierSettings) -> str:
     try:
         return result["content"][0]["text"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise ProviderError(f"Unexpected Anthropic payload: {result!r}") from exc
+        raise ProviderError(f"Unexpected Anthropic payload shape") from exc
 
 
 def _call_gemini(prompt: str, settings: ClassifierSettings) -> str:
+    assert_safe_for_outbound(prompt)
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         raise ProviderError("GEMINI_API_KEY (or GOOGLE_API_KEY) not set")
-    model = settings.model or "gemini-1.5-flash"
+    model = _resolve_gemini_model(settings)
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{model}:generateContent?key={api_key}"
@@ -157,7 +191,7 @@ def _call_gemini(prompt: str, settings: ClassifierSettings) -> str:
     try:
         return result["candidates"][0]["content"]["parts"][0]["text"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise ProviderError(f"Unexpected Gemini payload: {result!r}") from exc
+        raise ProviderError(f"Unexpected Gemini payload shape") from exc
 
 
 def classify(
@@ -167,6 +201,11 @@ def classify(
     settings: ClassifierSettings,
 ) -> Dict[str, object]:
     """Dispatch to the configured provider.
+
+    ``text`` is expected to already have passed through
+    :func:`scanorganizer.privacy.gate`. A defensive residual-PII check
+    inside each remote call ensures a forgetful caller still cannot leak
+    unscrubbed IDs.
 
     Falls back to the local keyword classifier if a remote provider fails.
     """
@@ -188,12 +227,15 @@ def classify(
         parsed["provider"] = settings.provider
         return parsed
     except Exception as exc:
-        log.warning("Classifier provider %s failed, falling back to local-keyword: %s",
-                    settings.provider, exc)
+        log.warning(
+            "Classifier provider %s failed, falling back to local-keyword: %s",
+            settings.provider,
+            type(exc).__name__,
+        )
         fallback = local_rules.classify(text, taxonomy, filename)
         fallback["provider"] = "local-keyword"
         fallback["fallback_from"] = settings.provider
-        fallback["fallback_reason"] = str(exc)
+        fallback["fallback_reason"] = type(exc).__name__
         return fallback
 
 
