@@ -32,8 +32,9 @@ from dataclasses import dataclass
 from typing import Dict, Optional
 
 from . import local_rules
-from .privacy import SensitiveTerms, assert_safe_for_outbound, sanitize_outbound_label
+from .privacy import SensitiveTerms, assert_safe_for_outbound
 from .taxonomy import DEFAULT_DOC_TYPE_ALIASES, Taxonomy, alias_doc_type
+from .vocabulary import OutboundSignals, extract_outbound_signals
 
 log = logging.getLogger(__name__)
 
@@ -76,42 +77,28 @@ def _extract_json(payload: str) -> Dict[str, object]:
         raise
 
 
-def _build_prompt(
-    taxonomy: Taxonomy,
-    text: str,
-    filename: str = "",
-    path: str = "",
-) -> str:
+def _build_prompt(taxonomy: Taxonomy, signals: OutboundSignals) -> str:
+    """Build an allowlist-only prompt. Never interpolates OCR, filenames, or paths."""
     allowed = taxonomy.describe_for_prompt()
-    extras: list[str] = []
-    if filename:
-        extras.append(f"Original filename: {filename}")
-    if path and path != filename:
-        extras.append(f"Original path: {path}")
-    extra_block = ("\n".join(extras) + "\n\n") if extras else ""
-    return f"""You are classifying scanned household/business documents into a strict taxonomy.
+    return f"""You are classifying scanned household business documents into a strict taxonomy.
 
-ALLOWED taxonomy nodes (owner / area / doc_type). You must pick EXACTLY one.
-Use "" (empty string) for area when the node has no area segment.
+ALLOWED taxonomy nodes owner area doc_type. You must pick EXACTLY one.
+Use empty string for area when the node has no area segment.
 
 {allowed}
 
-Return ONLY a JSON object with these keys, nothing else:
-  "owner":        string, must be one of the owners above
-  "area":         string, "" if the owner has no area segment
-  "doc_type":     string, must match the owner/area pair
-  "doc_date":     string "YYYY-MM-DD" (document date), "" if unknown
-  "confidence":   float 0..1 reflecting how sure you are about owner/area/doc_type
-  "short_name":   short descriptive name (lowercase, 2-4 words, underscores,
-                  no file extension, no PII)
+Return ONLY a JSON object with these keys nothing else
+  owner string must be one of the owners above
+  area string empty if the owner has no area segment
+  doc_type string must match the owner area pair
+  doc_date string empty if unknown
+  confidence float reflecting how sure you are about owner area doc_type
+  short_name short descriptive name lowercase words underscores no file extension no PII
 
-If you cannot confidently place the document in any node, set confidence < 0.5
-rather than guessing — the caller will route low-confidence documents for human review.
+If you cannot confidently place the document in any node set confidence low
+rather than guessing the caller will route low confidence documents for human review.
 
-{extra_block}Document text (sensitive values already redacted):
----
-{text}
----
+{signals.as_prompt_block()}
 """
 
 
@@ -159,6 +146,7 @@ def _call_anthropic(
     prompt: str,
     settings: ClassifierSettings,
     terms: Optional[SensitiveTerms] = None,
+    taxonomy: Optional[Taxonomy] = None,
 ) -> str:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -179,7 +167,7 @@ def _call_anthropic(
         },
         method="POST",
     )
-    assert_safe_for_outbound(prompt, terms)
+    assert_safe_for_outbound(prompt, terms, taxonomy=taxonomy)
     try:
         with urllib.request.urlopen(req, timeout=settings.timeout_s) as resp:
             result = json.loads(resp.read().decode("utf-8"))
@@ -197,6 +185,7 @@ def _call_gemini(
     prompt: str,
     settings: ClassifierSettings,
     terms: Optional[SensitiveTerms] = None,
+    taxonomy: Optional[Taxonomy] = None,
 ) -> str:
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
@@ -214,7 +203,7 @@ def _call_gemini(
             "responseMimeType": "application/json",
         },
     }
-    assert_safe_for_outbound(prompt, terms)
+    assert_safe_for_outbound(prompt, terms, taxonomy=taxonomy)
     last_status: Optional[int] = None
     last_body = ""
     result: Optional[Dict[str, object]] = None
@@ -325,11 +314,11 @@ def classify(
     """Dispatch to the configured provider.
 
     ``text`` is expected to already have passed through
-    :func:`scanorganizer.privacy.gate`. A defensive residual-PII check
-    inside each remote call ensures a forgetful caller still cannot leak
-    unscrubbed IDs. Filenames and paths are redacted (or dropped) before
-    they are interpolated into the prompt; a private-term hit on either
-    keeps the document local-only.
+    :func:`scanorganizer.privacy.gate`. The outbound prompt is built from
+    allowlisted signals only — OCR text, filenames, and paths are never
+    interpolated. A private-term hit on the filename or path keeps the
+    document local-only. A defensive token-allowlist check inside each
+    remote call ensures a forgetful caller still cannot leak leftovers.
 
     Falls back to the local keyword classifier if a remote provider fails.
     """
@@ -345,16 +334,12 @@ def classify(
         result["privacy_blocked"] = True
         return result
 
-    safe_name = sanitize_outbound_label(filename, terms)
-    safe_path = sanitize_outbound_label(file_path, terms) if file_path else ""
-    if safe_path == safe_name:
-        safe_path = ""
-    prompt = _build_prompt(taxonomy, text, filename=safe_name, path=safe_path)
+    prompt = _build_prompt(taxonomy, extract_outbound_signals(text))
     try:
         if settings.provider == "anthropic":
-            raw = _call_anthropic(prompt, settings, terms=terms)
+            raw = _call_anthropic(prompt, settings, terms=terms, taxonomy=taxonomy)
         elif settings.provider == "gemini":
-            raw = _call_gemini(prompt, settings, terms=terms)
+            raw = _call_gemini(prompt, settings, terms=terms, taxonomy=taxonomy)
         else:
             raise ProviderError(f"Unknown provider: {settings.provider}")
         parsed = _extract_json(raw)

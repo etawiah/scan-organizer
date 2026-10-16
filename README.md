@@ -43,8 +43,11 @@ reachable, plus:
   guarantees that no children's PII — and no SSN, EIN, routing, account,
   or card number — ever reaches a frontier model. Any private-term hit
   short-circuits to the local classifier (`local-only: sensitive`).
-  Everything else is scrubbed, then a defensive re-scan inside each
-  provider call refuses to transmit anything that still looks like an ID.
+  Medical / injury keywords force local-only regardless of category.
+  Outbound prompts are **allowlist-only**: never OCR text, filenames, or
+  paths — only taxonomy names, committed generic vocabulary hits, and
+  coarse features. A defensive token check inside each provider call
+  refuses anything outside that allowlist.
 - JSONL manifest of every move + `--undo <manifest>` to reverse a batch.
 - Re‑file mode: `--refile <dir>` promotes files from legacy flat folders into
   the new taxonomy (dry‑run capable).
@@ -81,23 +84,30 @@ For each file in `--src`:
      keywords), EINs (`##-#######`), account/routing numbers (digit runs
      of 8+ allowing spaces/dashes), payment cards (Luhn-valid 13–19 digit
      runs tagged `[REDACTED_CARD]`), labeled DOBs, **card/account
-     4-digit fragments**, **US street addresses**, and **Title-Case
-     person-name runs** are scrubbed. Fragments / addresses / names use
-     typed placeholders `[CARD]`, `[ADDRESS]`, `[NAME]`.
+     4-digit fragments** (including visible last-4 such as `****1234`),
+     **US street addresses** (case-insensitive, including PO Box),
+     **emails**, **VINs**, **title / lien numbers**, **law-firm names**,
+     and **Title-Case person-name runs** are scrubbed. Fragments /
+     addresses / names use typed placeholders `[CARD]`, `[ADDRESS]`,
+     `[NAME]`.
    * The same pass is applied to OCR text, filenames, and paths.
+   * Medical / injury keywords (`diagnosis`, `injury`, `claim`,
+     `physician`, `hospital`, `prescription`, `accident`, …) force
+     `local-only` regardless of the local taxonomy category.
    * The scrubbed text is re-scanned for residual PII shapes and for
      topical signals (SSN / tax / medical / school keywords). A hit on
      either keeps the document local.
    * The gate reports counts only — never the matched values — so logs
      and manifests never carry private strings.
-5. For non-sensitive documents, the scrubbed text is handed to the chosen
-   `--provider` for a JSON classification:
-   `{owner, area, doc_type, doc_date, confidence, short_name}`.
-   A defensive residual-PII check inside every provider call refuses to
-   transmit anything that still matches an ID, card fragment, US
-   address, or person-name pattern. Documents whose local keyword
-   pre-pass (or classification) is `Finance-Bank`, `ID-Legal`, or
-   `Medical` stay local-only; override with `LOCAL_ONLY_CATEGORIES`.
+5. For non-sensitive documents the provider sees an **allowlist prompt**
+   only: taxonomy-category names, keywords from the committed generic
+   vocabulary (`config/outbound_vocabulary.txt`) that appear in the
+   document, and coarse features (page bucket, has-dates, has-amounts).
+   OCR text, filenames, paths, numbers, names, emails, and addresses
+   never leave the host. `assert_safe_for_outbound` requires every
+   token to be in that vocabulary or the taxonomy. Documents whose
+   local keyword pre-pass is `Finance-Bank`, `ID-Legal`, or `Medical`
+   stay local-only; override with `LOCAL_ONLY_CATEGORIES`.
 6. The result is validated against `taxonomy.yaml`.
    - Not in the taxonomy → `_Review/`.
    - `confidence < confidence_threshold` (default 0.75) → `_Review/`.
@@ -432,6 +442,10 @@ The test suite covers:
   ProviderError logs status+body (not the prompt), `--provider-probe`.
 - `tests/test_print_prompts.py` — `--print-prompts` requires `--dry-run`,
   writes mode-0600 JSONL, and never calls `urlopen`.
+- `tests/test_allowlist_outbound.py` — allowlist prompts and fake-data
+  regressions for every leftover leak shape (ALL CAPS / PO Box
+  addresses, last-4, VIN, surname email, law firm, medical text in a
+  non-Medical doc).
 - `tests/test_outbound_privacy.py` — Anthropic and Gemini providers are
   mocked and the test asserts that no SSN, EIN, account, card, DOB, or
   private‑term value ever appears in the outbound prompt, logs, or

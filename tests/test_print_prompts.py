@@ -70,7 +70,13 @@ def test_print_prompts_never_calls_urlopen_and_writes_mode_600(
         prompt = rec["prompt"]
         assert_safe_for_outbound(prompt)
         assert "Zebulon" not in prompt
-        assert "Document text" in prompt
+        assert "Document text" not in prompt
+        assert "Original filename" not in prompt
+        assert "City" not in prompt
+        assert "541" not in prompt
+        assert "40" not in prompt
+        assert "electric" in prompt.lower() or "bill" in prompt.lower()
+        assert "Observed keywords" in prompt
     # The bill is a utility doc, so it would have gone to a provider.
     assert any(o.classification.get("print_prompts") for o in result.outcomes)
 

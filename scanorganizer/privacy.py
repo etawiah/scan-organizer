@@ -25,7 +25,12 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+from .vocabulary import disallowed_tokens, has_medical_or_injury
+
+if TYPE_CHECKING:
+    from .taxonomy import Taxonomy
 
 
 BUILTIN_SENSITIVE_TERMS: Tuple[str, ...] = (
@@ -381,10 +386,45 @@ _CARD_FRAG_RE = re.compile(
         |
         (?:acct|account)\s+\#?\d{4}
         |
-        (?:x{2,}|\*{2,}|\.{3,}|[xX]-)\d{4}
+        (?:x{2,}|\*{2,}|\.{3,}|[xX]-)\s*-?\s*\d{4}
     )
     \b
     """
+)
+
+# Masked last-4 leftovers that must never ride along after redaction
+# (****1234, XXXX1234, **** 1234). Broader than the card-fragment rule
+# so a visible last-4 always fails the outbound assert.
+_LAST4_VISIBLE_RE = re.compile(
+    r"(?i)(?:\*{2,}|x{2,}|\#{2,})\s*-?\s*\d{4}\b"
+)
+
+_EMAIL_RE = re.compile(
+    r"(?i)\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
+)
+
+_POBOX_RE = re.compile(
+    r"(?i)\b(?:P\.?\s*O\.?\s*Box|Post\s+Office\s+Box|POB)\s+#?\s*[A-Za-z0-9-]+"
+)
+
+_VIN_LABELED_RE = re.compile(
+    r"(?i)\b(?:vin|vehicle\s+identification(?:\s+number)?)\s*[:#]?\s*"
+    r"([A-HJ-NPR-Z0-9]{11,17})\b"
+)
+
+_VIN_STANDALONE_RE = re.compile(
+    r"\b(?=[A-HJ-NPR-Z0-9]{17}\b)"
+    r"(?=[A-HJ-NPR-Z0-9]*[A-HJ-NPR-Z])"
+    r"(?=[A-HJ-NPR-Z0-9]*\d)"
+    r"[A-HJ-NPR-Z0-9]{17}\b"
+)
+
+_TITLE_LIEN_RE = re.compile(
+    r"(?i)\b(?:title|lien)\s+(?:number|no\.?|#)\s*:?\s*[A-Z0-9-]{4,}\b"
+)
+
+_LAW_FIRM_RE = re.compile(
+    r"\b[A-Z][A-Za-z]+(?:\s*&\s*|\s+and\s+)[A-Z][A-Za-z]+\s+LLP\b"
 )
 
 _STREET_SUFFIX_RE = (
@@ -402,28 +442,31 @@ _US_STATE_ABBR = (
 )
 
 # House number + street name + suffix, optional suite, optional city/state/ZIP.
+# IGNORECASE so ALL CAPS forms (123 FAKEVILLE RD) match the same way as
+# Title Case. Street-name tokens are letter-started words, not [A-Z][a-z]+.
 _ADDRESS_RE = re.compile(
     rf"""
     \b
     \d{{1,6}}
     [\s_\-]+
-    (?:[A-Z][A-Za-z0-9.']+[\s_\-]+){{1,5}}
+    (?:[A-Za-z][A-Za-z0-9.']+[\s_\-]+){{1,5}}
     {_STREET_SUFFIX_RE}
     (?:[\s,]+{_SUITE_RE})?
     (?:
         [\s,]+
-        [A-Z][A-Za-z .'-]+
+        [A-Za-z][A-Za-z .'-]+
         [\s,]+
         (?:{_US_STATE_ABBR})
         (?:[\s,]+(?:\d{{5}}(?:-\d{{4}})?))?
     )?
     """,
-    re.VERBOSE,
+    re.VERBOSE | re.IGNORECASE,
 )
 
 # Standalone 5-digit ZIP or ZIP+4 sitting next to a state abbreviation.
 _STATE_ZIP_RE = re.compile(
-    rf"\b(?:{_US_STATE_ABBR})\s+\d{{5}}(?:-\d{{4}})?\b"
+    rf"\b(?:{_US_STATE_ABBR})\s+\d{{5}}(?:-\d{{4}})?\b",
+    re.IGNORECASE,
 )
 
 _HONORIFIC_RE = re.compile(
@@ -529,6 +572,7 @@ _ORG_SUFFIXES = frozenset({
     "bank", "insurance", "district", "university", "college", "clinic",
     "agency", "bureau", "office", "commission", "board", "association",
     "foundation", "trust", "group", "partners", "holdings",
+    "llp", "pllc", "pc",
     "technologies", "solutions", "systems", "bill", "invoice",
     "invoices", "receipt", "receipts", "form", "return", "filing",
     "report", "reports", "records", "record", "policy", "license",
@@ -648,7 +692,40 @@ def _find_addresses(text: str) -> List[str]:
         return []
     found = _ADDRESS_RE.findall(text)
     found.extend(_STATE_ZIP_RE.findall(text))
+    found.extend(_POBOX_RE.findall(text))
     return found
+
+
+def _find_emails(text: str) -> List[str]:
+    if not text:
+        return []
+    return _EMAIL_RE.findall(text)
+
+
+def _find_vins(text: str) -> List[str]:
+    if not text:
+        return []
+    found = list(_VIN_LABELED_RE.findall(text))
+    found.extend(_VIN_STANDALONE_RE.findall(text))
+    return found
+
+
+def _find_title_lien(text: str) -> List[str]:
+    if not text:
+        return []
+    return _TITLE_LIEN_RE.findall(text)
+
+
+def _find_visible_last4(text: str) -> List[str]:
+    if not text:
+        return []
+    return _LAST4_VISIBLE_RE.findall(text)
+
+
+def _find_law_firms(text: str) -> List[str]:
+    if not text:
+        return []
+    return _LAW_FIRM_RE.findall(text)
 
 
 def _find_names(text: str) -> List[str]:
@@ -656,7 +733,7 @@ def _find_names(text: str) -> List[str]:
 
 
 def _redact_addresses(text: str) -> Tuple[str, int]:
-    """Replace US street / state+ZIP shapes. Run *before* grouped-account."""
+    """Replace US street / state+ZIP / PO Box shapes. Run *before* grouped-account."""
     if not text:
         return text, 0
     count = 0
@@ -668,7 +745,41 @@ def _redact_addresses(text: str) -> Tuple[str, int]:
 
     out = _ADDRESS_RE.sub(_addr_sub, text)
     out = _STATE_ZIP_RE.sub(_addr_sub, out)
+    out = _POBOX_RE.sub(_addr_sub, out)
     return out, count
+
+
+def _redact_emails(text: str) -> Tuple[str, int]:
+    if not text:
+        return text, 0
+    return _EMAIL_RE.subn("[REDACTED_EMAIL]", text)
+
+
+def _redact_vins(text: str) -> Tuple[str, int]:
+    if not text:
+        return text, 0
+    count = 0
+
+    def _vin_sub(match: re.Match[str]) -> str:
+        nonlocal count
+        count += 1
+        return "[REDACTED_VIN]"
+
+    out = _VIN_LABELED_RE.sub(_vin_sub, text)
+    out = _VIN_STANDALONE_RE.sub(_vin_sub, out)
+    return out, count
+
+
+def _redact_title_lien(text: str) -> Tuple[str, int]:
+    if not text:
+        return text, 0
+    return _TITLE_LIEN_RE.subn("[REDACTED_TITLE]", text)
+
+
+def _redact_law_firms(text: str) -> Tuple[str, int]:
+    if not text:
+        return text, 0
+    return _LAW_FIRM_RE.subn("[NAME]", text)
 
 
 def _redact_card_fragments(text: str) -> Tuple[str, int]:
@@ -708,32 +819,49 @@ def _redact_identity(text: str, *, addresses: bool = True, cards: bool = True, n
     """Scrub card fragments, US addresses, and Title-Case person names.
 
     Returns ``(scrubbed_text, counts)`` with keys ``card``, ``address``,
-    ``name``. Applied to OCR text, filenames, and paths.
+    ``name``, ``email``, ``vin``, ``title_lien``. Applied to OCR text,
+    filenames, and paths.
     """
-    counts: Dict[str, int] = {"card": 0, "address": 0, "name": 0}
+    counts: Dict[str, int] = {
+        "card": 0, "address": 0, "name": 0,
+        "email": 0, "vin": 0, "title_lien": 0,
+    }
     if not text:
         return text, counts
     out = text
     if addresses:
         out, n = _redact_addresses(out)
         counts["address"] += n
+    out, n = _redact_emails(out)
+    counts["email"] += n
+    out, n = _redact_vins(out)
+    counts["vin"] += n
+    out, n = _redact_title_lien(out)
+    counts["title_lien"] += n
     if cards:
         out, n = _redact_card_fragments(out)
         counts["card"] += n
     if names:
+        out, n = _redact_law_firms(out)
+        counts["name"] += n
         out, n = _redact_names(out)
         counts["name"] += n
     return out, counts
 
 
 def _identity_leak_count(text: str) -> int:
-    """Count name / address / card-fragment shapes still present in ``text``."""
+    """Count name / address / card-fragment / email / VIN shapes still present."""
     if not text:
         return 0
     return (
         len(_find_card_fragments(text))
+        + len(_find_visible_last4(text))
         + len(_find_addresses(text))
         + len(_find_names(text))
+        + len(_find_emails(text))
+        + len(_find_vins(text))
+        + len(_find_title_lien(text))
+        + len(_find_law_firms(text))
     )
 
 
@@ -891,10 +1019,11 @@ def redact(text: str) -> str:
     and paths: number-shaped IDs plus card fragments, US addresses, and
     Title-Case person-name runs.
     """
-    # Addresses (including state+ZIP / ZIP+4) must run before the
+    # Addresses (including state+ZIP / ZIP+4 / PO Box) must run before the
     # grouped-account rule so ``NJ 00000-0000`` is not eaten as an acct.
     # Full PANs run next so ``ending in 4111 1111 1111 1111`` is a card,
-    # then leftover 4-digit fragments and person names.
+    # then leftover 4-digit fragments, emails, VINs, title/lien numbers,
+    # and person names.
     scrubbed, _ = _redact_identity(text, cards=False, names=False)
     scrubbed, _ = _redact_pii(scrubbed)
     scrubbed, _ = _redact_identity(scrubbed, addresses=False)
@@ -911,16 +1040,21 @@ def gate(text: str, terms: SensitiveTerms) -> RedactionReport:
        built-ins). A non-zero hit count means ``sensitive`` immediately —
        no amount of further scrubbing will unblock an outbound call.
     2. Redact SSN / EIN / account / card / DOB in a single ordered pass.
-    3. Redact card/account 4-digit fragments, US street addresses, and
-       Title-Case person-name runs (filenames and paths use this same pass).
-    4. Re-scan the scrubbed output for residual PII shapes. Anything that
+    3. Redact card/account 4-digit fragments, US street addresses (including
+       ALL CAPS and PO Box), emails, VINs, title / lien numbers, law-firm
+       names, and Title-Case person-name runs.
+    4. Medical / injury keywords force ``sensitive`` (``medical-injury``)
+       regardless of the local taxonomy category.
+    5. Re-scan the scrubbed output for residual PII shapes. Anything that
        slips through flips ``sensitive`` to true.
-    5. Count topical sensitive-subject keywords. ``>= TOPICAL_HIT_THRESHOLD``
+    6. Count topical sensitive-subject keywords. ``>= TOPICAL_HIT_THRESHOLD``
        flips ``sensitive`` to true even when all values were scrubbed.
     """
     counts: Dict[str, int] = {"private_term": 0, "ssn": 0, "ein": 0,
                               "acct": 0, "card": 0, "dob": 0,
                               "address": 0, "name": 0,
+                              "email": 0, "vin": 0, "title_lien": 0,
+                              "medical_injury": 0,
                               "residual_pii": 0, "topic": 0}
     if not text:
         return RedactionReport(scrubbed_text=text or "", category_counts=counts)
@@ -938,6 +1072,14 @@ def gate(text: str, terms: SensitiveTerms) -> RedactionReport:
     counts["card"] += identity_first.get("card", 0) + identity_counts.get("card", 0)
     counts["address"] = identity_first.get("address", 0) + identity_counts.get("address", 0)
     counts["name"] = identity_first.get("name", 0) + identity_counts.get("name", 0)
+    counts["email"] = identity_first.get("email", 0) + identity_counts.get("email", 0)
+    counts["vin"] = identity_first.get("vin", 0) + identity_counts.get("vin", 0)
+    counts["title_lien"] = (
+        identity_first.get("title_lien", 0) + identity_counts.get("title_lien", 0)
+    )
+
+    medical_hit = has_medical_or_injury(text)
+    counts["medical_injury"] = 1 if medical_hit else 0
 
     residual = _residual_pii_count(scrubbed)
     counts["residual_pii"] = residual
@@ -949,6 +1091,9 @@ def gate(text: str, terms: SensitiveTerms) -> RedactionReport:
     if private_hits > 0:
         sensitive = True
         reason = "private-term-match"
+    elif medical_hit:
+        sensitive = True
+        reason = "medical-injury"
     elif residual > 0:
         sensitive = True
         reason = "residual-pii"
@@ -1006,22 +1151,30 @@ def _load_user_terms_for_outbound() -> SensitiveTerms:
     return SensitiveTerms.load(path=None, include_builtins=False)
 
 
-def assert_safe_for_outbound(text: str, terms: Optional[SensitiveTerms] = None) -> None:
-    """Raise ``ValueError`` if ``text`` still contains a PII shape or private term.
+def assert_safe_for_outbound(
+    text: str,
+    terms: Optional[SensitiveTerms] = None,
+    taxonomy: Optional["Taxonomy"] = None,
+) -> None:
+    """Raise ``ValueError`` if ``text`` is not allowlist-safe for a provider.
 
     Used as a defensive gate inside each provider call so that any future
-    code path that forgets to run :func:`gate` still fails loudly rather
-    than silently exfiltrating data.
+    code path that forgets the allowlist still fails loudly rather than
+    silently exfiltrating data.
 
     Checks:
 
     * Residual number PII (SSN / EIN / account / card shapes).
-    * Card/account 4-digit fragments, US street addresses, and Title-Case
-      person-name runs.
+    * Card/account 4-digit fragments (including visible last-4), US street
+      addresses (case-insensitive, including PO Box), emails, VINs,
+      title / lien numbers, law-firm names, and Title-Case person-name runs.
     * User-supplied private terms from ``config/private_terms.txt``,
       ``PRIVATE_TERMS`` / ``SCAN_PRIVATE_TERMS``, or ``terms.file_terms``
       when a matcher is passed. Case-insensitive including ALL CAPS;
       lone given names match on their own; ``_`` / ``-`` are boundaries.
+    * Every alphanumeric token is in the committed generic vocabulary,
+      the taxonomy category names, or the prompt scaffold. The token
+      itself is never included in the exception (it may be PII).
     """
     if _residual_pii_count(text) > 0:
         raise ValueError(
@@ -1031,6 +1184,10 @@ def assert_safe_for_outbound(text: str, terms: Optional[SensitiveTerms] = None) 
     if checker.contains_user_term(text):
         raise ValueError(
             "refusing to send outbound text: private term detected"
+        )
+    if disallowed_tokens(text, taxonomy):
+        raise ValueError(
+            "refusing to send outbound text: token not in allowlist"
         )
 
 

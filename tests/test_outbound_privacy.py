@@ -317,16 +317,20 @@ def test_prompt_never_contains_raw_filename_when_it_has_a_private_term(
     assert safe_name == ""
     assert safe_path == ""
 
+    from scanorganizer.vocabulary import extract_outbound_signals
+
     prompt = classifier_mod._build_prompt(
         taxonomy,
-        "City Electric Co monthly electric bill. Amount due $40.00.",
-        filename=safe_name,
-        path=safe_path,
+        extract_outbound_signals(
+            "City Electric Co monthly electric bill. Amount due $40.00."
+        ),
     )
     assert FAKE_PRIVATE_NAME not in prompt
     assert "Zebulon" not in prompt
     assert raw_name not in prompt
     assert "Original filename:" not in prompt
+    assert "Document text" not in prompt
+    assert "City" not in prompt
 
     # classify() itself must also refuse the cloud path and never interpolate
     # the raw filename into a prompt that would go on the wire.

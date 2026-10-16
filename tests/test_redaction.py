@@ -108,8 +108,15 @@ def test_assert_safe_for_outbound_detects_raw_card():
         assert_safe_for_outbound("Card 4111111111111111 charged.")
 
 
-def test_assert_safe_for_outbound_allows_scrubbed_text():
-    assert_safe_for_outbound("Scrubbed: [REDACTED_SSN] [REDACTED_CARD] due.")
+def test_assert_safe_for_outbound_allows_allowlisted_prompt(taxonomy):
+    from scanorganizer.classifier import _build_prompt
+    from scanorganizer.vocabulary import extract_outbound_signals
+
+    prompt = _build_prompt(
+        taxonomy, extract_outbound_signals("Invoice statement. Amount due."),
+    )
+    assert_safe_for_outbound(prompt, taxonomy=taxonomy)
+    assert_safe_for_outbound("ping")
 
 
 def test_assert_safe_for_outbound_raises_on_private_term():
@@ -127,8 +134,9 @@ def test_assert_safe_for_outbound_raises_on_private_term():
         assert_safe_for_outbound("please file this letter for zebulon quill today", terms)
     with pytest.raises(ValueError):
         assert_safe_for_outbound("Patient: Quill, Zebulon (minor).", terms)
-    # Whole-word only: a longer token must not trip the matcher.
-    assert_safe_for_outbound("No private names here, just a utility bill.", terms)
+    # Whole-word only: a longer token must not trip the matcher. The
+    # passing payload must itself be allowlist-safe (no free-form OCR).
+    assert_safe_for_outbound("utility bill", terms)
 
 
 def test_luhn_valid_recognizes_test_cards():

@@ -24,8 +24,8 @@ from .privacy import (
     SensitiveTerms,
     assert_safe_for_outbound,
     gate,
-    sanitize_outbound_label,
 )
+from .vocabulary import extract_outbound_signals
 from .scanner import CandidateFile, walk_inbox
 from .taxonomy import Taxonomy, TaxonomyError, TaxonomyNode
 
@@ -132,13 +132,13 @@ def _classify_file(
     """Single redaction gate shared by every provider path.
 
     ``text`` is OCR output. We *always* run it through
-    :func:`scanorganizer.privacy.gate` first, which both scrubs the
-    outbound copy and decides whether the document is safe to leave the
-    host at all. The original filename and path are checked the same way:
-    a private-term hit on either marks the file ``local-only: sensitive``.
-    Labels that are not blocked still go through the same redaction before
-    they are interpolated into a provider prompt, and are dropped if they
-    are not clean. Sensitive documents fall through to the local keyword
+    :func:`scanorganizer.privacy.gate` first, which decides whether the
+    document is safe to leave the host at all. Medical / injury keywords
+    force local-only regardless of category. The original filename and
+    path are checked the same way: a private-term hit on either marks the
+    file ``local-only: sensitive``. Outbound prompts are built from
+    allowlisted signals only — OCR text, filenames, and paths are never
+    interpolated. Sensitive documents fall through to the local keyword
     classifier and the manifest records a ``local-only: sensitive`` entry
     together with category counts (never the matched strings themselves).
     """
@@ -167,21 +167,14 @@ def _classify_file(
         result["privacy_blocked"] = True
         result["privacy_report"] = report.summary_for_manifest()
         return result
-    scrubbed = report.scrubbed_text or ""
     if print_prompts:
-        safe_name = sanitize_outbound_label(file_path.name, sensitive_terms)
-        raw_path = str(file_path)
-        safe_path = sanitize_outbound_label(raw_path, sensitive_terms) if raw_path else ""
-        if safe_path == safe_name:
-            safe_path = ""
-        prompt = classifier_mod._build_prompt(
-            taxonomy, scrubbed, filename=safe_name, path=safe_path,
-        )
-        assert_safe_for_outbound(prompt, sensitive_terms)
+        signals = extract_outbound_signals(text)
+        prompt = classifier_mod._build_prompt(taxonomy, signals)
+        assert_safe_for_outbound(prompt, sensitive_terms, taxonomy=taxonomy)
         if prompts_writer is not None:
             prompts_writer.write({
                 "src": str(file_path),
-                "filename": safe_name,
+                "filename": file_path.name,
                 "prompt": prompt,
             })
         result = local_guess
@@ -190,7 +183,7 @@ def _classify_file(
         result["privacy_report"] = report.summary_for_manifest()
         return result
     out = classifier_mod.classify(
-        scrubbed,
+        text,
         file_path.name,
         taxonomy,
         settings,
