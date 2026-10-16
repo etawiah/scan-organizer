@@ -295,7 +295,11 @@ transmit anything that still matches an ID pattern.
    Confirm: `mountpoint -q /mnt/nas/scans && echo OK`.
 
 2. Prepare host config (keeps your taxonomy + sensitive terms outside the
-   image):
+   image). The container searches `$SCAN_CONFIG_DIR`, then `/config`
+   (the compose mount), then `/app/config` (baked-in vocabulary and
+   taxonomy), then `./config`. Host files win; missing files fall
+   through. The outbound vocabulary is copied into the image so a
+   host mount that omits it no longer fails closed at startup.
 
    ```bash
    sudo mkdir -p /opt/scan-organizer/config

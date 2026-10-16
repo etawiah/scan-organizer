@@ -1132,13 +1132,12 @@ def sanitize_outbound_label(value: str, terms: Optional[SensitiveTerms] = None) 
 
 
 def _default_private_term_paths() -> Tuple[Path, ...]:
-    here = Path(__file__).resolve().parent.parent
-    return (
-        here / "config" / "private_terms.txt",
-        here / "private_terms.txt",
-        Path("config/private_terms.txt"),
-        Path("private_terms.txt"),
-    )
+    from .config import resolve_private_terms_path
+
+    found = resolve_private_terms_path()
+    if found is not None:
+        return (found,)
+    return ()
 
 
 def _load_user_terms_for_outbound() -> SensitiveTerms:

@@ -8,7 +8,10 @@
 #
 # Environment:
 #   SCANS_HOST_PATH         Host path where the NFS share is mounted
-#   CONFIG_HOST_PATH        Host path holding taxonomy.yaml + private_terms.txt
+#   CONFIG_HOST_PATH        Host path mounted at /config. May contain
+#                           taxonomy.yaml, private_terms.txt, and
+#                           outbound_vocabulary.txt. Missing files fall
+#                           through to the image's /app/config defaults.
 #   SCAN_PROVIDER           anthropic | gemini | local-keyword
 #   SCAN_MODEL              Optional model id override
 #   ANTHROPIC_API_KEY       Required when SCAN_PROVIDER=anthropic
@@ -31,6 +34,7 @@ services:
     user: ${SCAN_UID_GID:-1033:100}
     environment:
       SCANS_ROOT: /scans
+      SCAN_CONFIG_DIR: ${SCAN_CONFIG_DIR:-/config}
       SCAN_PROVIDER: ${SCAN_PROVIDER:-local-keyword}
       SCAN_MODEL: ${SCAN_MODEL:-}
       GEMINI_MODEL: ${GEMINI_MODEL:-}
@@ -46,10 +50,10 @@ services:
         source: ${CONFIG_HOST_PATH:-./config}
         target: /config
         read_only: true
-    # Overlay the user's config files on top of the baked-in defaults.
+    # Config resolution: $SCAN_CONFIG_DIR (/config) → /app/config → ./config.
+    # Do not hard-require host files; a missing taxonomy.yaml or vocabulary
+    # on the mount falls through to the baked-in /app/config copies.
     command: >-
       --non-interactive
-      --taxonomy /config/taxonomy.yaml
-      --private-terms /config/private_terms.txt
     # The weekly batch is launched via `docker compose run --rm`, so no
     # restart policy is defined. Keep the service short-lived.

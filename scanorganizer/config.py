@@ -1,10 +1,12 @@
-"""Static defaults and small shared constants."""
+"""Static defaults, config-path resolution, and small shared constants."""
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
-from typing import FrozenSet, Optional
+from typing import FrozenSet, Iterable, Optional, Tuple
 
 DEFAULT_SCANS_ROOT = Path("/scans")
 
@@ -39,6 +41,113 @@ REFILE_LEGACY_DIRNAMES = {
 }
 
 PROVIDERS = ("anthropic", "gemini", "local-keyword")
+
+# Config files resolved in this order: $SCAN_CONFIG_DIR, /config,
+# /app/config, ./config. The host bind-mount in docker-compose is /config.
+VOCABULARY_FILENAME = "outbound_vocabulary.txt"
+TAXONOMY_FILENAME = "taxonomy.yaml"
+PRIVATE_TERMS_FILENAME = "private_terms.txt"
+
+_log = logging.getLogger(__name__)
+
+
+def package_root() -> Path:
+    """Repository / image root that contains ``scanorganizer/``."""
+    return Path(__file__).resolve().parent.parent
+
+
+def _builtin_config_dirs() -> Tuple[Path, ...]:
+    return (Path("/config"), Path("/app/config"), Path("config"))
+
+
+def config_search_dirs() -> Tuple[Path, ...]:
+    """Directories searched for taxonomy, vocabulary, and private terms."""
+    dirs: list[Path] = []
+    env = os.environ.get("SCAN_CONFIG_DIR")
+    if env and env.strip():
+        dirs.append(Path(env.strip()))
+    dirs.extend(_builtin_config_dirs())
+    return _unique_paths(dirs)
+
+
+def _unique_paths(paths: Iterable[Path]) -> Tuple[Path, ...]:
+    seen: set[str] = set()
+    out: list[Path] = []
+    for raw in paths:
+        path = Path(raw)
+        try:
+            key = str(path.expanduser().resolve())
+        except OSError:
+            key = str(path)
+        if key not in seen:
+            seen.add(key)
+            out.append(path)
+    return tuple(out)
+
+
+def _legacy_taxonomy_files() -> Tuple[Path, ...]:
+    return (Path("taxonomy.yaml"), package_root() / "taxonomy.yaml")
+
+
+def _legacy_private_terms_files() -> Tuple[Path, ...]:
+    return (Path("private_terms.txt"), package_root() / "private_terms.txt")
+
+
+@lru_cache(maxsize=32)
+def resolve_config_file(
+    filename: str,
+    *,
+    required: bool = False,
+    extra_files: Tuple[Path, ...] = (),
+) -> Optional[Path]:
+    """Return the first existing ``filename`` on the config search path.
+
+    Logs the chosen path (never file contents). ``required`` raises
+    ``RuntimeError`` when nothing is found — used for the outbound
+    vocabulary so a missing file fails closed.
+    """
+    candidates: list[Path] = [directory / filename for directory in config_search_dirs()]
+    candidates.extend(extra_files)
+    for path in _unique_paths(candidates):
+        try:
+            if path.is_file():
+                _log.info("using %s: %s", filename, path)
+                return path
+        except OSError:
+            continue
+    if required:
+        raise RuntimeError(f"{filename} is missing or empty")
+    _log.info("no %s found on the config search path", filename)
+    return None
+
+
+def resolve_vocabulary_path() -> Path:
+    """Fail-closed: the outbound vocabulary must exist."""
+    found = resolve_config_file(VOCABULARY_FILENAME, required=True)
+    assert found is not None
+    return found
+
+
+def resolve_taxonomy_path() -> Path:
+    found = resolve_config_file(
+        TAXONOMY_FILENAME,
+        extra_files=_legacy_taxonomy_files(),
+    )
+    if found is None:
+        raise RuntimeError(f"{TAXONOMY_FILENAME} is missing or empty")
+    return found
+
+
+def resolve_private_terms_path() -> Optional[Path]:
+    return resolve_config_file(
+        PRIVATE_TERMS_FILENAME,
+        extra_files=_legacy_private_terms_files(),
+    )
+
+
+def clear_config_resolution_cache() -> None:
+    """Drop cached path lookups. Tests call this after env / dir changes."""
+    resolve_config_file.cache_clear()
 
 # Documents whose local pre-pass (or classification) lands in these
 # doc_types stay on-host by default. Override with LOCAL_ONLY_CATEGORIES
