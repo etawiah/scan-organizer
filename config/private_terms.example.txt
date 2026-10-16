@@ -1,0 +1,37 @@
+# Private sensitive-terms list for scan-organizer.
+#
+# Copy this file to `config/private_terms.txt` (which is .gitignored) and
+# replace the placeholders below with the real names, schools, and keywords
+# you want the redaction gate to catch. Entries are matched case-insensitive
+# with whole-word boundaries, and two-word names are automatically also
+# matched in `Last, First` order.
+#
+# When ANY term in this file matches the OCR'd text of a document,
+# scan-organizer:
+#   * marks the document `local-only: sensitive` in the manifest,
+#   * classifies it locally with keyword rules,
+#   * and makes ZERO calls to any LLM provider for that document.
+#
+# Blank lines and `# comments` are ignored.
+
+# ---- People (replace with real names) ----
+Jane Placeholder-Doe
+John Example Smith
+
+# ---- Schools (replace with real schools) ----
+Placeholder Elementary
+Example Middle School
+Sample High School
+
+# ---- Medical / minor-related keywords (keep or adjust) ----
+school
+pediatric
+report card
+immunization
+DOB
+guardian
+parent-teacher
+IEP
+Section 504
+minor child
+custody

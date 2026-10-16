@@ -14,7 +14,7 @@ from scanorganizer.organizer import process_batch
 SAMPLE_TEXTS = {
     "irs_2025.pdf": "IRS 1040 tax return for tax year 2025 filed by taxpayer.",
     "mystery.pdf": "",  # empty OCR -> _Unsorted/
-    "report_card.pdf": "Lincoln Elementary Report Card — grade 4 — immunization record attached.",
+    "report_card.pdf": "Placeholder Elementary Report Card — grade 4 — immunization record attached.",
 }
 
 
@@ -59,7 +59,7 @@ def test_sensitive_doc_classified_locally_and_routed(
 ):
     cfg = runconfig_factory(
         provider="local-keyword",
-        extra_terms=["Lincoln Elementary"],
+        extra_terms=["Placeholder Elementary"],
     )
     result = process_batch(cfg)
     sensitive = next(o for o in result.outcomes if o.src.name == "report_card.pdf")

@@ -1,11 +1,19 @@
 # Private sensitive-terms list — must NEVER be committed. Only the example
 # file (private_terms.example.txt) is tracked.
 private_terms.txt
+config/private_terms.txt
+
+# Local environment overrides (API keys, provider settings). The committed
+# `.env.example` is the only env file in version control.
+.env
+.env.local
 
 # Local scratch / data
 /scans/
 /dest/
-/config/
+# NOTE: `/config/` as a whole is NOT ignored anymore — the committed
+# `config/private_terms.example.txt` lives there. Only the real secrets
+# file (`config/private_terms.txt`) is ignored above.
 *.jsonl
 summary-*.md
 .scan_organizer_config.json
