@@ -61,13 +61,21 @@ OLLAMA_OCR_CHAR_CAP = 10_000
 
 _OLLAMA_LOCK = threading.Lock()
 
-# Literal hosts plus RFC1918 / loopback. Remote hostnames are refused so a
-# mis-set OLLAMA_URL cannot leak redacted OCR off the LAN.
-_RFC1918_NETWORKS = (
+# Literal hosts plus an explicit LAN allowlist. Remote hostnames are
+# refused so a mis-set OLLAMA_URL cannot leak redacted OCR off the LAN.
+# IPv4: loopback + RFC1918. IPv6: ::1 and ULA (fc00::/7) only.
+# IPv4-mapped / IPv4-compatible IPv6 is converted and rechecked as IPv4.
+# Unspecified addresses (::, 0.0.0.0) are always refused.
+_ALLOWED_V4_NETWORKS = (
+    ipaddress.ip_network("127.0.0.0/8"),
     ipaddress.ip_network("10.0.0.0/8"),
     ipaddress.ip_network("172.16.0.0/12"),
     ipaddress.ip_network("192.168.0.0/16"),
 )
+_IPV6_LOOPBACK = ipaddress.ip_address("::1")
+_IPV6_ULA = ipaddress.ip_network("fc00::/7")
+_UNSPECIFIED_V4 = ipaddress.ip_address("0.0.0.0")
+_UNSPECIFIED_V6 = ipaddress.ip_address("::")
 _LOCALHOST_NAMES = frozenset({"localhost", "localhost.localdomain"})
 
 # Retry transient Gemini capacity / rate-limit failures. "Up to 3 times"
@@ -225,8 +233,27 @@ The document text below has already had private terms redacted. Classify it.
 """
 
 
+def _ipv4_from_mapped_or_compat(ip: ipaddress.IPv6Address) -> Optional[ipaddress.IPv4Address]:
+    """Return the embedded IPv4 address for mapped (::ffff:) or compat (::) form."""
+    mapped = ip.ipv4_mapped
+    if mapped is not None:
+        return mapped
+    # IPv4-compatible ::a.b.c.d (96-bit zero prefix). :: and ::1 are
+    # handled by the caller before this conversion.
+    packed = ip.packed
+    if packed[:12] == b"\x00" * 12:
+        return ipaddress.IPv4Address(packed[12:])
+    return None
+
+
+def _is_allowed_ipv4(ip: ipaddress.IPv4Address) -> bool:
+    if ip == _UNSPECIFIED_V4:
+        return False
+    return any(ip in network for network in _ALLOWED_V4_NETWORKS)
+
+
 def _is_allowed_ollama_host(host: str) -> bool:
-    """True only for localhost, IPv4/IPv6 loopback, or RFC1918 / ULA."""
+    """True only for localhost, IPv4 loopback/RFC1918, ::1, or fc00::/7."""
     name = (host or "").strip().lower().rstrip(".")
     if name.startswith("[") and name.endswith("]"):
         name = name[1:-1]
@@ -238,12 +265,16 @@ def _is_allowed_ollama_host(host: str) -> bool:
         ip = ipaddress.ip_address(name)
     except ValueError:
         return False
-    if ip.is_loopback:
-        return True
-    if ip.version == 4:
-        return any(ip in network for network in _RFC1918_NETWORKS)
-    # IPv6 unique-local (fc00::/7) is the LAN equivalent of RFC1918.
-    return ip.is_private and not ip.is_link_local and not ip.is_multicast
+    if ip.version == 6:
+        if ip == _UNSPECIFIED_V6:
+            return False
+        if ip == _IPV6_LOOPBACK or ip in _IPV6_ULA:
+            return True
+        embedded = _ipv4_from_mapped_or_compat(ip)
+        if embedded is not None:
+            return _is_allowed_ipv4(embedded)
+        return False
+    return _is_allowed_ipv4(ip)
 
 
 def validate_ollama_url(url: str) -> str:

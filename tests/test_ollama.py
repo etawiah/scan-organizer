@@ -22,6 +22,7 @@ from scanorganizer.classifier import (
     _resolve_ollama_model,
     _resolve_ollama_timeout,
     cap_ollama_ocr_text,
+    _is_allowed_ollama_host,
     classify,
     resolve_ollama_url,
     validate_ollama_url,
@@ -96,12 +97,20 @@ def _ok_generate(text: str | None = None):
         "http://172.16.0.1:11434",
         "http://172.31.255.1",
         "https://192.168.0.2:11434",
+        "http://[::1]",
+        "http://[fd00::5]",
+        "http://[fd00::5]:11434",
     ],
 )
 def test_validate_ollama_url_allows_localhost_and_rfc1918(url):
     cleaned = validate_ollama_url(url)
     assert cleaned.startswith("http")
     assert "://" in cleaned
+
+
+def test_validate_ollama_url_accepts_bracketed_ula_and_loopback():
+    assert validate_ollama_url("http://[::1]").endswith("://[::1]")
+    assert validate_ollama_url("http://[fd00::5]").endswith("://[fd00::5]")
 
 
 @pytest.mark.parametrize(
@@ -119,11 +128,44 @@ def test_validate_ollama_url_allows_localhost_and_rfc1918(url):
         "",
         "http://",
         "http://user:pass@127.0.0.1:11434",
+        "http://[::]",
+        "http://0.0.0.0:11434",
+        "http://[2001:db8::1]",
+        "http://[64:ff9b:1::808:808]",
+        "http://[::ffff:8.8.8.8]",
+        "http://192.168.1.1.evil.com",
+        "http://user@192.168.1.5",
     ],
 )
 def test_validate_ollama_url_refuses_remote_hosts(url):
     with pytest.raises(OllamaURLError):
         validate_ollama_url(url)
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "::",
+        "2001:db8::1",
+        "64:ff9b:1::808:808",
+        "::ffff:8.8.8.8",
+        "[::ffff:8.8.8.8]",
+        "0.0.0.0",
+        "192.168.1.1.evil.com",
+    ],
+)
+def test_ollama_host_allowlist_refuses_review_cases(host):
+    assert _is_allowed_ollama_host(host) is False
+
+
+@pytest.mark.parametrize("host", ["::1", "[::1]", "fd00::5", "[fd00::5]"])
+def test_ollama_host_allowlist_accepts_loopback_and_ula(host):
+    assert _is_allowed_ollama_host(host) is True
+
+
+def test_ollama_url_refuses_userinfo_without_password():
+    with pytest.raises(OllamaURLError, match="userinfo"):
+        validate_ollama_url("http://user@192.168.1.5")
 
 
 def test_default_ollama_url_is_localhost(monkeypatch):
@@ -373,3 +415,62 @@ def test_env_example_uses_lan_placeholder():
     assert "# OLLAMA_URL=http://192.168.x.x:11434" in text
     assert "# OLLAMA_MODEL=qwen2.5:7b-instruct" in text
     assert "llama3.2" not in text
+
+
+def test_low_confidence_ollama_answer_goes_to_review(
+    tmp_scan_tree, runconfig_factory, monkeypatch,
+):
+    monkeypatch.setenv("OLLAMA_URL", "http://192.168.3.10:11434")
+    _write(tmp_scan_tree["src"] / "bill.pdf", CLEAN_BILL)
+
+    def fake_extract(path: Path, max_pages: int = 5, dpi: int = 300) -> str:
+        return CLEAN_BILL
+
+    def fake_urlopen(req, timeout=None):
+        return _ok_chat(json.dumps({
+            "owner": "Household",
+            "area": "Home",
+            "doc_type": "Utilities",
+            "confidence": 0.2,
+            "short_name": "should_not_file",
+            "doc_date": "",
+        }))
+
+    monkeypatch.setattr(ocr_mod, "extract_text", fake_extract)
+    monkeypatch.setattr(classifier_mod.urllib.request, "urlopen", fake_urlopen)
+    cfg = runconfig_factory(provider="ollama")
+    result = process_batch(cfg)
+    assert result.outcomes
+    outcome = result.outcomes[0]
+    assert outcome.action == "review"
+    assert cfg.review_dir in outcome.dest.parents
+    assert outcome.classification.get("confidence") == 0.2
+    assert "should_not_file" not in (outcome.dest.name if outcome.dest else "")
+
+
+def test_private_term_kids_hit_never_calls_ollama(
+    tmp_scan_tree, runconfig_factory, monkeypatch,
+):
+    monkeypatch.setenv("OLLAMA_URL", "http://192.168.3.10:11434")
+    kids = (
+        "Placeholder Elementary Report Card — grade 4 — immunization record. "
+        "Student Zebulon Quill."
+    )
+    _write(tmp_scan_tree["src"] / "zebulon_report_card.pdf", kids)
+
+    def fake_extract(path: Path, max_pages: int = 5, dpi: int = 300) -> str:
+        return kids
+
+    def boom(*_a, **_k):
+        raise AssertionError("ollama must not be called for a private-term/kids hit")
+
+    monkeypatch.setattr(ocr_mod, "extract_text", fake_extract)
+    monkeypatch.setattr(classifier_mod, "_call_ollama", boom)
+    monkeypatch.setattr(classifier_mod, "classify", boom)
+    cfg = runconfig_factory(provider="ollama", extra_terms=["Zebulon Quill"])
+    result = process_batch(cfg)
+    assert result.outcomes
+    outcome = result.outcomes[0]
+    assert outcome.provider == "local-keyword"
+    assert outcome.classification.get("privacy_blocked") is True
+    assert outcome.classification.get("privacy") == "local-only: sensitive"
