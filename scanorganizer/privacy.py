@@ -118,6 +118,19 @@ def _expand_name_variants(term: str) -> List[str]:
     return variants
 
 
+def _unique_terms(collected: Iterable[str]) -> List[str]:
+    seen: Set[str] = set()
+    unique: List[str] = []
+    for term in collected:
+        if not term:
+            continue
+        key = term.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(term)
+    return unique
+
+
 @dataclass
 class SensitiveTerms:
     """Case-insensitive whole-word matcher over user-supplied private terms.
@@ -125,9 +138,15 @@ class SensitiveTerms:
     Internally terms expand to include ``Last, First`` variants and the
     matcher only reports counts — never the matched values — so results are
     safe to log.
+
+    ``terms`` is the full matching list (builtins + user file + extras).
+    ``file_terms`` is only what the user supplied (``private_terms.txt`` and
+    ``extra_terms``) — used by the outbound prompt guard so generic builtin
+    keywords like ``school`` cannot false-positive against the taxonomy listing.
     """
 
     terms: List[str] = field(default_factory=list)
+    file_terms: List[str] = field(default_factory=list)
 
     @classmethod
     def load(
@@ -137,22 +156,20 @@ class SensitiveTerms:
         include_builtins: bool = True,
     ) -> "SensitiveTerms":
         collected: List[str] = []
+        user_collected: List[str] = []
         if include_builtins:
             collected.extend(BUILTIN_SENSITIVE_TERMS)
         if path:
             p = Path(path)
             if p.exists():
-                collected.extend(_load_terms_file(p))
+                loaded = _load_terms_file(p)
+                collected.extend(loaded)
+                user_collected.extend(loaded)
         if extra_terms:
-            collected.extend(t for t in extra_terms if t)
-        seen: Set[str] = set()
-        unique: List[str] = []
-        for term in collected:
-            key = term.lower()
-            if key not in seen:
-                seen.add(key)
-                unique.append(term)
-        return cls(terms=unique)
+            extras = [t for t in extra_terms if t]
+            collected.extend(extras)
+            user_collected.extend(extras)
+        return cls(terms=_unique_terms(collected), file_terms=_unique_terms(user_collected))
 
     def _expanded(self) -> List[str]:
         out: List[str] = []
@@ -195,6 +212,16 @@ class SensitiveTerms:
     def contains_sensitive(self, text: str) -> bool:
         """True iff ``text`` contains any private-term hit."""
         return self.count_hits(text) > 0
+
+    def contains_user_term(self, text: str) -> bool:
+        """True iff ``text`` contains a *user-supplied* private term.
+
+        Built-in topical keywords are excluded. Matching is case-insensitive
+        with whole-word boundaries (including ``Last, First`` name variants).
+        """
+        if not text or not self.file_terms:
+            return False
+        return SensitiveTerms(terms=list(self.file_terms), file_terms=list(self.file_terms)).contains_sensitive(text)
 
     # Legacy name used by older tests: returns matched terms. Kept for
     # backward compatibility only. New code must prefer ``count_hits``
@@ -480,16 +507,70 @@ def gate(text: str, terms: SensitiveTerms) -> RedactionReport:
     )
 
 
-def assert_safe_for_outbound(text: str) -> None:
-    """Raise ``ValueError`` if ``text`` still contains a PII shape.
+def sanitize_outbound_label(value: str, terms: Optional[SensitiveTerms] = None) -> str:
+    """Redact a filename or path the same way document text is redacted.
+
+    Private terms and number-shaped PII are scrubbed. Returns the scrubbed
+    value, or ``""`` (drop from the prompt) when a private term matched or
+    residual number PII remains after redaction.
+    """
+    if not value:
+        return ""
+    if terms is not None:
+        report = gate(value, terms)
+        if report.category_counts.get("private_term", 0) > 0:
+            return ""
+        if _residual_pii_count(report.scrubbed_text) > 0:
+            return ""
+        return report.scrubbed_text
+    scrubbed, _ = _redact_pii(value)
+    if _residual_pii_count(scrubbed) > 0:
+        return ""
+    return scrubbed
+
+
+def _default_private_term_paths() -> Tuple[Path, ...]:
+    here = Path(__file__).resolve().parent.parent
+    return (
+        here / "config" / "private_terms.txt",
+        here / "private_terms.txt",
+        Path("config/private_terms.txt"),
+        Path("private_terms.txt"),
+    )
+
+
+def _load_user_terms_for_outbound() -> SensitiveTerms:
+    for p in _default_private_term_paths():
+        try:
+            if p.exists():
+                return SensitiveTerms.load(path=p, include_builtins=False)
+        except OSError:
+            continue
+    return SensitiveTerms.load(path=None, include_builtins=False)
+
+
+def assert_safe_for_outbound(text: str, terms: Optional[SensitiveTerms] = None) -> None:
+    """Raise ``ValueError`` if ``text`` still contains a PII shape or private term.
 
     Used as a defensive gate inside each provider call so that any future
     code path that forgets to run :func:`gate` still fails loudly rather
     than silently exfiltrating data.
+
+    Checks:
+
+    * Residual number PII (SSN / EIN / account / card shapes).
+    * User-supplied private terms from ``config/private_terms.txt`` (or
+      ``terms.file_terms`` when a matcher is passed), case-insensitive with
+      word boundaries.
     """
     if _residual_pii_count(text) > 0:
         raise ValueError(
             "refusing to send outbound text: residual PII pattern detected"
+        )
+    checker = terms if terms is not None else _load_user_terms_for_outbound()
+    if checker.contains_user_term(text):
+        raise ValueError(
+            "refusing to send outbound text: private term detected"
         )
 
 

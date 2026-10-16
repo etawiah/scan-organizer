@@ -119,7 +119,7 @@ _RULES: Tuple[Rule, ...] = (
     Rule("Business", "ComplexTech", "Contracts", (
         "master service agreement", "msa ", "statement of work", "sow ",
     ), "complextech_contract", 0.55),
-    Rule("Business", "ComplexTech", "Tax", (
+    Rule("Business", "ComplexTech", "Taxes", (
         "ein", "employer identification", "form 941",
     ), "complextech_tax", 0.55),
     Rule("Business", "ComplexTech", "Payroll", (

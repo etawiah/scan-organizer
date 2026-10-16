@@ -112,6 +112,24 @@ def test_assert_safe_for_outbound_allows_scrubbed_text():
     assert_safe_for_outbound("Scrubbed: [REDACTED_SSN] [REDACTED_CARD] due.")
 
 
+def test_assert_safe_for_outbound_raises_on_private_term():
+    import pytest
+
+    terms = SensitiveTerms.load(
+        path=None,
+        extra_terms=["Zebulon Quill"],
+        include_builtins=False,
+    )
+    with pytest.raises(ValueError, match="private term"):
+        assert_safe_for_outbound("Please file this letter for Zebulon Quill.", terms)
+    with pytest.raises(ValueError, match="private term"):
+        assert_safe_for_outbound("please file this letter for zebulon quill today", terms)
+    with pytest.raises(ValueError, match="private term"):
+        assert_safe_for_outbound("Patient: Quill, Zebulon (minor).", terms)
+    # Whole-word only: a longer token must not trip the matcher.
+    assert_safe_for_outbound("No private names here, just a utility bill.", terms)
+
+
 def test_luhn_valid_recognizes_test_cards():
     assert _luhn_valid("4111111111111111")
     assert _luhn_valid("5555555555554444")

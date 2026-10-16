@@ -31,8 +31,8 @@ from dataclasses import dataclass
 from typing import Dict, Optional
 
 from . import local_rules
-from .privacy import assert_safe_for_outbound
-from .taxonomy import Taxonomy
+from .privacy import SensitiveTerms, assert_safe_for_outbound, sanitize_outbound_label
+from .taxonomy import DEFAULT_DOC_TYPE_ALIASES, Taxonomy, alias_doc_type
 
 log = logging.getLogger(__name__)
 
@@ -67,8 +67,19 @@ def _extract_json(payload: str) -> Dict[str, object]:
         raise
 
 
-def _build_prompt(taxonomy: Taxonomy, text: str, filename: str) -> str:
+def _build_prompt(
+    taxonomy: Taxonomy,
+    text: str,
+    filename: str = "",
+    path: str = "",
+) -> str:
     allowed = taxonomy.describe_for_prompt()
+    extras: list[str] = []
+    if filename:
+        extras.append(f"Original filename: {filename}")
+    if path and path != filename:
+        extras.append(f"Original path: {path}")
+    extra_block = ("\n".join(extras) + "\n\n") if extras else ""
     return f"""You are classifying scanned household/business documents into a strict taxonomy.
 
 ALLOWED taxonomy nodes (owner / area / doc_type). You must pick EXACTLY one.
@@ -88,9 +99,7 @@ Return ONLY a JSON object with these keys, nothing else:
 If you cannot confidently place the document in any node, set confidence < 0.5
 rather than guessing — the caller will route low-confidence documents for human review.
 
-Original filename: {filename}
-
-Document text (sensitive values already redacted):
+{extra_block}Document text (sensitive values already redacted):
 ---
 {text}
 ---
@@ -123,8 +132,11 @@ def _resolve_gemini_model(settings: ClassifierSettings) -> str:
     )
 
 
-def _call_anthropic(prompt: str, settings: ClassifierSettings) -> str:
-    assert_safe_for_outbound(prompt)
+def _call_anthropic(
+    prompt: str,
+    settings: ClassifierSettings,
+    terms: Optional[SensitiveTerms] = None,
+) -> str:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise ProviderError("ANTHROPIC_API_KEY not set")
@@ -144,6 +156,7 @@ def _call_anthropic(prompt: str, settings: ClassifierSettings) -> str:
         },
         method="POST",
     )
+    assert_safe_for_outbound(prompt, terms)
     try:
         with urllib.request.urlopen(req, timeout=settings.timeout_s) as resp:
             result = json.loads(resp.read().decode("utf-8"))
@@ -157,15 +170,18 @@ def _call_anthropic(prompt: str, settings: ClassifierSettings) -> str:
         raise ProviderError(f"Unexpected Anthropic payload shape") from exc
 
 
-def _call_gemini(prompt: str, settings: ClassifierSettings) -> str:
-    assert_safe_for_outbound(prompt)
+def _call_gemini(
+    prompt: str,
+    settings: ClassifierSettings,
+    terms: Optional[SensitiveTerms] = None,
+) -> str:
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         raise ProviderError("GEMINI_API_KEY (or GOOGLE_API_KEY) not set")
     model = _resolve_gemini_model(settings)
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{model}:generateContent?key={api_key}"
+        f"{model}:generateContent"
     )
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -178,9 +194,13 @@ def _call_gemini(prompt: str, settings: ClassifierSettings) -> str:
     req = urllib.request.Request(
         url,
         data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        },
         method="POST",
     )
+    assert_safe_for_outbound(prompt, terms)
     try:
         with urllib.request.urlopen(req, timeout=settings.timeout_s) as resp:
             result = json.loads(resp.read().decode("utf-8"))
@@ -194,18 +214,35 @@ def _call_gemini(prompt: str, settings: ClassifierSettings) -> str:
         raise ProviderError(f"Unexpected Gemini payload shape") from exc
 
 
+def _labels_contain_private_term(
+    filename: str,
+    file_path: str,
+    terms: Optional[SensitiveTerms],
+) -> bool:
+    if terms is None:
+        return False
+    for value in (filename, file_path):
+        if value and terms.contains_sensitive(str(value)):
+            return True
+    return False
+
+
 def classify(
     text: str,
     filename: str,
     taxonomy: Taxonomy,
     settings: ClassifierSettings,
+    terms: Optional[SensitiveTerms] = None,
+    file_path: str = "",
 ) -> Dict[str, object]:
     """Dispatch to the configured provider.
 
     ``text`` is expected to already have passed through
     :func:`scanorganizer.privacy.gate`. A defensive residual-PII check
     inside each remote call ensures a forgetful caller still cannot leak
-    unscrubbed IDs.
+    unscrubbed IDs. Filenames and paths are redacted (or dropped) before
+    they are interpolated into the prompt; a private-term hit on either
+    keeps the document local-only.
 
     Falls back to the local keyword classifier if a remote provider fails.
     """
@@ -214,12 +251,23 @@ def classify(
         result["provider"] = "local-keyword"
         return result
 
-    prompt = _build_prompt(taxonomy, text, filename)
+    if _labels_contain_private_term(filename, file_path, terms):
+        result = local_rules.classify(text, taxonomy, filename)
+        result["provider"] = "local-keyword"
+        result["privacy"] = "local-only: sensitive"
+        result["privacy_blocked"] = True
+        return result
+
+    safe_name = sanitize_outbound_label(filename, terms)
+    safe_path = sanitize_outbound_label(file_path, terms) if file_path else ""
+    if safe_path == safe_name:
+        safe_path = ""
+    prompt = _build_prompt(taxonomy, text, filename=safe_name, path=safe_path)
     try:
         if settings.provider == "anthropic":
-            raw = _call_anthropic(prompt, settings)
+            raw = _call_anthropic(prompt, settings, terms=terms)
         elif settings.provider == "gemini":
-            raw = _call_gemini(prompt, settings)
+            raw = _call_gemini(prompt, settings, terms=terms)
         else:
             raise ProviderError(f"Unknown provider: {settings.provider}")
         parsed = _extract_json(raw)
@@ -244,7 +292,10 @@ def _coerce(raw: Dict[str, object]) -> Dict[str, object]:
     out["owner"] = str(raw.get("owner", "") or "").strip()
     area = raw.get("area", "")
     out["area"] = "" if area is None else str(area).strip()
-    out["doc_type"] = str(raw.get("doc_type", "") or "").strip()
+    out["doc_type"] = alias_doc_type(
+        str(raw.get("doc_type", "") or "").strip(),
+        DEFAULT_DOC_TYPE_ALIASES,
+    )
     out["doc_date"] = str(raw.get("doc_date", "") or "").strip()
     try:
         out["confidence"] = float(raw.get("confidence", 0.0) or 0.0)

@@ -19,13 +19,17 @@ confidence_threshold: 0.75
 review_folder: _Review
 unsorted_folder: _Unsorted
 
+# Historical classifier output used "Tax"; the canonical category is "Taxes".
+doc_type_aliases:
+  Tax: Taxes
+
 tree:
   Business:
     ComplexTech:
       - Invoices-Out
       - Bills-In
       - Contracts
-      - Tax
+      - Taxes
       - Payroll
       - Bank
       - Licenses-Insurance
@@ -33,7 +37,7 @@ tree:
       - Invoices
       - Bills
       - Contracts
-      - Tax
+      - Taxes
       - Bank
       - Corporate
     432SouthStVT:
