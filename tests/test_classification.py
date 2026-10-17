@@ -5,6 +5,7 @@ import pytest
 
 from scanorganizer import local_rules
 from scanorganizer.classifier import ClassifierSettings, _coerce, classify
+from scanorganizer.naming import sanitize_short_name
 from scanorganizer.taxonomy import Taxonomy
 
 
@@ -108,6 +109,19 @@ def test_coerce_reads_constrained_category_payload():
     assert out["category"] == "Household/Home/Utilities"
     assert out["confidence"] == 0.91
     assert out["reason"] == "electric bill"
+
+
+def test_coerce_keeps_optional_short_name_and_doc_date():
+    out = _coerce({
+        "category": "Household/Home/Utilities",
+        "confidence": 0.91,
+        "reason": "electric bill",
+        "short_name": "Electric Bill!!",
+        "doc_date": "2026-09-01",
+    })
+    assert out["short_name"] == "Electric Bill!!"
+    assert out["doc_date"] == "2026-09-01"
+    assert sanitize_short_name(out["short_name"]) == "electric_bill"
 
 
 def test_classifier_falls_back_when_remote_missing(taxonomy, monkeypatch):

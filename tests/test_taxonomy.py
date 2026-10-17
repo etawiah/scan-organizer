@@ -243,8 +243,9 @@ def test_snap_doc_type_suffix_to_longest_leaf(taxonomy):
     assert node is not None
     assert node.as_canonical_path() == "Business/ComplexTech/Taxes"
     assert classification["snapped"] is True
-    assert classification["confidence"] == 0.0
+    assert classification["snapped_from"]
     assert classification["category"] == "Business/ComplexTech/Taxes"
+    assert classification["confidence"] == 0.99
 
 
 def test_snap_does_not_cross_owners_or_sibling_businesses(taxonomy):
@@ -287,7 +288,37 @@ def test_snapped_suffix_goes_to_review_and_is_marked(
     assert outcome.classification.get("snapped") is True
     assert outcome.classification.get("snapped_from") == "Business/ComplexTech/Taxes//W-2"
     assert outcome.classification.get("category") == "Business/ComplexTech/Taxes"
-    assert outcome.classification.get("confidence") == 0.0
+    assert outcome.reason == "snapped category suffix"
+
+
+def test_snapped_goes_to_review_even_when_threshold_is_zero(
+    tmp_scan_tree, runconfig_factory, monkeypatch,
+):
+    _write(tmp_scan_tree["src"] / "w2.pdf", "City Electric Co monthly electric bill. kWh 40.")
+
+    def fake_extract(path: Path, max_pages: int = 5, dpi: int = 300) -> str:
+        return "City Electric Co monthly electric bill. kWh 40."
+
+    def fake_classify(*_a, **_k):
+        return {
+            "category": "Business/ComplexTech/Taxes//W-2",
+            "confidence": 0.99,
+            "reason": "form looks like a w2",
+            "provider": "ollama",
+            "is_local": True,
+        }
+
+    monkeypatch.setattr(ocr_mod, "extract_text", fake_extract)
+    monkeypatch.setattr(classifier_mod, "classify", fake_classify)
+    cfg = runconfig_factory(provider="ollama", threshold=0.0)
+    assert cfg.taxonomy.confidence_threshold == 0.0
+    result = process_batch(cfg)
+    outcome = result.outcomes[0]
+    assert outcome.action == "review"
+    assert cfg.review_dir in outcome.dest.parents
+    assert outcome.classification.get("snapped") is True
+    assert outcome.classification.get("confidence") == 0.99
+    assert outcome.reason == "snapped category suffix"
 
 
 def test_personal_double_slash_category_files_when_confident(

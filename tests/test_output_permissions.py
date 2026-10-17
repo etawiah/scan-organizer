@@ -1,19 +1,23 @@
-"""Run output files (manifest, summary, logs) are owner-only (mode 0600)."""
+"""Run output files that hold filenames are owner-only; dest folders stay normal."""
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 from pathlib import Path
 
-from scanorganizer.cli import main
+import pytest
+
+from scanorganizer import classifier as classifier_mod
+from scanorganizer import ocr as ocr_mod
 from scanorganizer.manifest import ManifestEntry, ManifestWriter
-from scanorganizer.secureio import (
-    OWNER_ONLY_FILE_MODE,
-    RESTRICTIVE_UMASK,
-    apply_restrictive_umask,
-    chmod_owner_only,
-)
+from scanorganizer.organizer import process_batch
+from scanorganizer.secureio import OWNER_ONLY_FILE_MODE, chmod_owner_only
 from scanorganizer.summary import write_summary
+from tests.test_outbound_privacy import _write
+
+
+CLEAN_BILL = "City Electric Co monthly electric bill. kWh used 541. Amount due $40.00."
 
 
 def _mode(path: Path) -> int:
@@ -58,31 +62,60 @@ def test_chmod_owner_only_tightens_existing_world_readable_file(tmp_path):
     assert _mode(path) == 0o600
 
 
-def test_main_applies_restrictive_umask(tmp_path, monkeypatch):
-    previous = os.umask(0o022)
-    os.umask(previous)
-    try:
-        monkeypatch.chdir(tmp_path)
-        try:
-            main(["--help"])
-        except SystemExit as exc:
-            assert exc.code in (0, None)
-        assert os.umask(previous) == RESTRICTIVE_UMASK
-        os.umask(RESTRICTIVE_UMASK)
-        probe = tmp_path / "created-after-main.txt"
-        probe.write_text("x", encoding="utf-8")
-        assert _mode(probe) == 0o600
-    finally:
-        os.umask(previous)
+@pytest.mark.parametrize("umask_value,expected_dir_mode", [(0o022, 0o755), (0o002, 0o775)])
+def test_dest_folders_keep_normal_permissions_outputs_are_600(
+    tmp_scan_tree, runconfig_factory, monkeypatch, umask_value, expected_dir_mode,
+):
+    """Taxonomy / review dirs follow the process umask; outputs stay 0600."""
+    _write(tmp_scan_tree["src"] / "bill.pdf", CLEAN_BILL)
 
+    def fake_extract(path: Path, max_pages: int = 5, dpi: int = 300) -> str:
+        return CLEAN_BILL
 
-def test_apply_restrictive_umask_constant():
-    assert RESTRICTIVE_UMASK == 0o077
-    assert OWNER_ONLY_FILE_MODE == 0o600
-    previous = os.umask(0o022)
+    def fake_classify(*_a, **_k):
+        return {
+            "category": "Household/Home/Utilities",
+            "confidence": 0.99,
+            "reason": "electric bill",
+            "short_name": "electric_bill",
+            "doc_date": "2026-09-01",
+            "provider": "ollama",
+            "is_local": True,
+        }
+
+    monkeypatch.setattr(ocr_mod, "extract_text", fake_extract)
+    monkeypatch.setattr(classifier_mod, "classify", fake_classify)
+    cfg = runconfig_factory(provider="ollama")
+    shutil.rmtree(cfg.review_dir)
+    shutil.rmtree(cfg.unsorted_dir)
+
+    previous = os.umask(umask_value)
     try:
-        prior = apply_restrictive_umask()
-        assert prior == 0o022
-        assert os.umask(RESTRICTIVE_UMASK) == RESTRICTIVE_UMASK
+        result = process_batch(cfg)
+        outcome = result.outcomes[0]
+        assert outcome.action == "move"
+        assert outcome.dest is not None
+        dest_folder = outcome.dest.parent
+        assert dest_folder.relative_to(cfg.dest).parts == ("Household", "Home", "Utilities")
+        assert dest_folder.is_dir()
+        assert _mode(dest_folder) == expected_dir_mode
+        assert _mode(dest_folder.parent) == expected_dir_mode
+        assert _mode(cfg.review_dir) == expected_dir_mode
+        assert _mode(cfg.unsorted_dir) == expected_dir_mode
+        assert _mode(dest_folder) != 0o700
+        assert _mode(cfg.manifest_path) == OWNER_ONLY_FILE_MODE
+
+        summary_path = write_summary(
+            {
+                "counts": {},
+                "folder_counts": {},
+                "review": [],
+                "unsorted": [],
+                "errors": [],
+                "providers": {},
+            },
+            tmp_scan_tree["log"] / "summary-perms.md",
+        )
+        assert _mode(summary_path) == OWNER_ONLY_FILE_MODE
     finally:
         os.umask(previous)

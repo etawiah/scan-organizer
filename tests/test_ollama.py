@@ -49,7 +49,12 @@ def _assert_constrained_ollama_body(body: dict, taxonomy) -> None:
     assert "Personal/Medical" in enum
     assert "Business/ComplexTech/Taxes" in enum
     assert all("//" not in path for path in enum)
-    assert set(fmt["required"]) >= {"category", "confidence", "reason"}
+    assert set(fmt["required"]) == {"category", "confidence", "reason"}
+    assert "short_name" in fmt["properties"]
+    assert "doc_date" in fmt["properties"]
+    assert "short_name" not in fmt["required"]
+    assert "doc_date" not in fmt["required"]
+    assert fmt["additionalProperties"] is False
     assert body["options"]["temperature"] == DEFAULT_OLLAMA_TEMPERATURE
     assert DEFAULT_OLLAMA_TEMPERATURE == 0.0
 
@@ -399,6 +404,10 @@ def test_ollama_response_schema_enum_is_exact_leaf_paths(taxonomy):
     assert enum == taxonomy.leaf_paths()
     assert all("//" not in path for path in enum)
     assert "Personal/Medical" in enum
+    assert schema["properties"]["short_name"] == {"type": "string"}
+    assert schema["properties"]["doc_date"] == {"type": "string"}
+    assert set(schema["required"]) == {"category", "confidence", "reason"}
+    assert schema["additionalProperties"] is False
     assert DEFAULT_OLLAMA_MODEL == "qwen2.5:7b-instruct"
 
 
@@ -494,6 +503,36 @@ def test_env_example_uses_lan_placeholder():
     assert "# OLLAMA_MODEL=qwen2.5:7b-instruct" in text
     assert "# OLLAMA_OCR_CHAR_CAP=10000" in text
     assert "llama3.2" not in text
+
+
+def test_ollama_short_name_and_doc_date_are_used_in_filename(
+    tmp_scan_tree, runconfig_factory, monkeypatch,
+):
+    monkeypatch.setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+    _write(tmp_scan_tree["src"] / "bill.pdf", CLEAN_BILL)
+
+    def fake_extract(path: Path, max_pages: int = 5, dpi: int = 300) -> str:
+        return CLEAN_BILL
+
+    def fake_urlopen(req, timeout=None):
+        return _ok_chat(json.dumps({
+            "category": "Household/Home/Utilities",
+            "confidence": 0.91,
+            "reason": "electric bill",
+            "short_name": "Electric Bill!!",
+            "doc_date": "2026-09-01",
+        }))
+
+    monkeypatch.setattr(ocr_mod, "extract_text", fake_extract)
+    monkeypatch.setattr(classifier_mod.urllib.request, "urlopen", fake_urlopen)
+    cfg = runconfig_factory(provider="ollama")
+    result = process_batch(cfg)
+    outcome = result.outcomes[0]
+    assert outcome.action == "move"
+    assert outcome.dest is not None
+    assert outcome.dest.name == "electric_bill_2026-09-01.pdf"
+    assert outcome.classification.get("short_name") == "Electric Bill!!"
+    assert outcome.classification.get("doc_date") == "2026-09-01"
 
 
 def test_ollama_accepts_constrained_category_json(monkeypatch, taxonomy):

@@ -255,6 +255,12 @@ def ollama_response_format(taxonomy: Taxonomy) -> Dict[str, object]:
             "reason": {
                 "type": "string",
             },
+            "short_name": {
+                "type": "string",
+            },
+            "doc_date": {
+                "type": "string",
+            },
         },
         "required": ["category", "confidence", "reason"],
         "additionalProperties": False,
@@ -281,6 +287,8 @@ Return ONLY a JSON object with these keys nothing else
   category string must be exactly one of the allowed paths above
   confidence float reflecting how sure you are about the category
   reason short explanation with no PII
+  short_name optional short descriptive name lowercase words underscores no file extension no PII
+  doc_date optional string empty if unknown
 
 If you cannot confidently place the document in any path set confidence low
 rather than guessing the caller will route low confidence documents for human review.

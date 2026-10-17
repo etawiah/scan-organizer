@@ -26,6 +26,7 @@ from .privacy import (
     assert_safe_for_outbound,
     gate,
 )
+from .secureio import chmod_owner_only
 from .vocabulary import extract_outbound_signals
 from .scanner import CandidateFile, walk_inbox
 from .taxonomy import Taxonomy, TaxonomyNode
@@ -104,6 +105,7 @@ class PromptDumpWriter:
             pass
         self._fh = os.fdopen(self._fd, "w", encoding="utf-8")
         self._fd = None
+        chmod_owner_only(self.path)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -228,11 +230,11 @@ def _resolve_node(
 
     Exact leaf matches keep the model's confidence. A valid leaf followed
     by extra trailing segments (a document-type suffix) snaps to that
-    leaf, is marked ``snapped`` in the classification, and is treated as
-    low confidence so it goes to ``_Review/`` unless the threshold is 0.
-    Invalid, empty, or unrecognised paths return ``None`` so the caller
-    routes the file to ``_Review/`` and never files it. This never snaps
-    across top-level owners or between sibling businesses.
+    leaf and is marked ``snapped`` so the caller always routes the file
+    to ``_Review/``, regardless of the confidence threshold. Invalid,
+    empty, or unrecognised paths return ``None`` so the caller also
+    routes them to ``_Review/``. This never snaps across top-level
+    owners or between sibling businesses.
     """
     hit = taxonomy.match_or_snap_classification(classification)
     if hit is None:
@@ -250,8 +252,6 @@ def _resolve_node(
         except (TypeError, ValueError):
             original_conf = 0.0
         classification["model_confidence"] = original_conf
-        # Snapped suffixes are not exact matches: force low confidence.
-        classification["confidence"] = 0.0
     else:
         classification["snapped"] = False
     return node
@@ -406,9 +406,10 @@ def _process_file(
         return FileOutcome(src=file_path, dest=dest, action="review",
                            reason=reason, classification=classification, provider=provider)
 
-    if node is None or confidence < cfg.taxonomy.confidence_threshold:
+    if node is None or classification.get("snapped") or confidence < cfg.taxonomy.confidence_threshold:
         reason = (
             "invalid taxonomy node" if node is None
+            else "snapped category suffix" if classification.get("snapped")
             else f"confidence {confidence:.2f} < threshold {cfg.taxonomy.confidence_threshold:.2f}"
         )
         dest = _route_to_fallback(file_path, cfg.review_dir, file_path.name, cfg.dry_run)

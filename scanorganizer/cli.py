@@ -43,7 +43,6 @@ from .manifest import undo as undo_manifest
 from .organizer import RunConfig, process_batch, refile_folders
 from .privacy import SensitiveTerms
 from .summary import summarize, write_summary
-from .secureio import apply_restrictive_umask
 from .taxonomy import Taxonomy
 from .vocabulary import load_outbound_vocabulary
 
@@ -265,7 +264,6 @@ def _run_interactive(parser: argparse.ArgumentParser) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    apply_restrictive_umask()
     parser = build_parser()
 
     if argv is None and len(sys.argv) == 1 and sys.stdin.isatty():
