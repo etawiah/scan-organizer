@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Iterable, List
 
 from .manifest import ManifestEntry, read_entries
+from .secureio import chmod_owner_only
 
 
 def summarize(entries: Iterable[ManifestEntry]) -> dict:
@@ -118,6 +119,7 @@ def write_summary(summary: dict, out_path: Path, when: date | None = None) -> Pa
         lines.append("")
 
     out_path.write_text("\n".join(lines), encoding="utf-8")
+    chmod_owner_only(out_path)
     return out_path
 
 

@@ -35,7 +35,7 @@ def test_ollama_private_term_file_reaches_ollama_with_full_text(
     _seed_private_file(tmp_scan_tree, monkeypatch)
     captured = []
 
-    def fake_ollama(prompt, settings):
+    def fake_ollama(prompt, settings, taxonomy=None):
         captured.append(prompt)
         return json.dumps({
             "owner": "Family",

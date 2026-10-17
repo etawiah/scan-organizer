@@ -12,6 +12,7 @@ from scanorganizer import classifier as classifier_mod
 from scanorganizer import ocr as ocr_mod
 from scanorganizer.classifier import (
     DEFAULT_OLLAMA_MODEL,
+    DEFAULT_OLLAMA_TEMPERATURE,
     DEFAULT_OLLAMA_TIMEOUT_S,
     DEFAULT_OLLAMA_URL,
     MIN_OLLAMA_TIMEOUT_S,
@@ -22,6 +23,8 @@ from scanorganizer.classifier import (
     _resolve_ollama_model,
     _resolve_ollama_timeout,
     cap_ollama_ocr_text,
+    ollama_response_format,
+    resolve_ollama_ocr_char_cap,
     _is_allowed_ollama_host,
     classify,
     resolve_ollama_url,
@@ -35,6 +38,25 @@ from tests.test_outbound_privacy import _write
 
 
 CLEAN_BILL = "City Electric Co monthly electric bill. kWh used 541. Amount due $40.00."
+
+
+def _assert_constrained_ollama_body(body: dict, taxonomy) -> None:
+    fmt = body["format"]
+    assert isinstance(fmt, dict)
+    assert fmt["type"] == "object"
+    enum = fmt["properties"]["category"]["enum"]
+    assert enum == taxonomy.leaf_paths()
+    assert "Personal/Medical" in enum
+    assert "Business/ComplexTech/Taxes" in enum
+    assert all("//" not in path for path in enum)
+    assert set(fmt["required"]) == {"category", "confidence", "reason"}
+    assert "short_name" in fmt["properties"]
+    assert "doc_date" in fmt["properties"]
+    assert "short_name" not in fmt["required"]
+    assert "doc_date" not in fmt["required"]
+    assert fmt["additionalProperties"] is False
+    assert body["options"]["temperature"] == DEFAULT_OLLAMA_TEMPERATURE
+    assert DEFAULT_OLLAMA_TEMPERATURE == 0.0
 
 
 def _ok_chat(text: str | None = None):
@@ -232,7 +254,7 @@ def test_ollama_sends_full_redacted_ocr_and_skips_allowlist(
     def fake_urlopen(req, timeout=None):
         captured.append(req)
         body = json.loads(req.data.decode("utf-8"))
-        assert body["format"] == "json"
+        _assert_constrained_ollama_body(body, taxonomy)
         assert body["model"] == "qwen2.5:7b-instruct"
         assert body["stream"] is False
         return _ok_chat()
@@ -264,6 +286,10 @@ def test_ollama_sends_full_redacted_ocr_and_skips_allowlist(
     assert "kWh used 541" in prompt
     assert "City Electric Co" in prompt
     assert report.scrubbed_text in prompt
+    assert "Personal/Medical" in prompt
+    assert "Personal//Medical" not in prompt
+    assert "//" not in taxonomy.describe_for_prompt()
+    assert "category string must be exactly one of the allowed paths above" in prompt
 
 
 def test_ollama_falls_back_to_generate_on_chat_404(monkeypatch, taxonomy):
@@ -275,7 +301,7 @@ def test_ollama_falls_back_to_generate_on_chat_404(monkeypatch, taxonomy):
         if str(req.full_url).endswith("/api/chat"):
             raise _http_error(404, "not found")
         body = json.loads(req.data.decode("utf-8"))
-        assert body["format"] == "json"
+        _assert_constrained_ollama_body(body, taxonomy)
         assert "prompt" in body
         return _ok_generate()
 
@@ -308,7 +334,7 @@ def test_ollama_private_term_filename_still_reaches_ollama(monkeypatch, taxonomy
     monkeypatch.setenv("OLLAMA_URL", "http://127.0.0.1:11434")
     called = {"n": 0}
 
-    def fake_call(prompt, settings):
+    def fake_call(prompt, settings, taxonomy=None):
         called["n"] += 1
         assert "City Electric Co" in prompt
         return json.dumps({
@@ -346,7 +372,7 @@ def test_ollama_local_only_category_reaches_ollama(
     called = {"n": 0}
     bank = "checking account monthly statement deposit withdrawal"
 
-    def fake_call(prompt, settings):
+    def fake_call(prompt, settings, taxonomy=None):
         called["n"] += 1
         assert "checking account" in prompt
         return json.dumps({
@@ -370,6 +396,47 @@ def test_ollama_local_only_category_reaches_ollama(
     assert called["n"] == 1
     assert result.outcomes[0].provider == "ollama"
     assert not result.outcomes[0].classification.get("privacy_blocked")
+
+
+def test_ollama_response_schema_enum_is_exact_leaf_paths(taxonomy):
+    schema = ollama_response_format(taxonomy)
+    enum = schema["properties"]["category"]["enum"]
+    assert enum == taxonomy.leaf_paths()
+    assert all("//" not in path for path in enum)
+    assert "Personal/Medical" in enum
+    assert schema["properties"]["short_name"] == {"type": "string"}
+    assert schema["properties"]["doc_date"] == {"type": "string"}
+    assert set(schema["required"]) == {"category", "confidence", "reason"}
+    assert schema["additionalProperties"] is False
+    assert DEFAULT_OLLAMA_MODEL == "qwen2.5:7b-instruct"
+
+
+def test_ollama_ocr_char_cap_is_configurable(monkeypatch, taxonomy):
+    monkeypatch.delenv("OLLAMA_OCR_CHAR_CAP", raising=False)
+    monkeypatch.delenv("SCAN_OLLAMA_OCR_CHAR_CAP", raising=False)
+    assert resolve_ollama_ocr_char_cap() == OLLAMA_OCR_CHAR_CAP
+    assert resolve_ollama_ocr_char_cap(ClassifierSettings(provider="ollama")) == 10_000
+    monkeypatch.setenv("OLLAMA_OCR_CHAR_CAP", "250")
+    assert resolve_ollama_ocr_char_cap() == 250
+    assert resolve_ollama_ocr_char_cap(
+        ClassifierSettings(provider="ollama", ollama_ocr_char_cap=80)
+    ) == 80
+    monkeypatch.setenv("OLLAMA_URL", "http://192.168.3.10:11434")
+    captured = []
+
+    def fake_urlopen(req, timeout=None):
+        captured.append(json.loads(req.data.decode("utf-8")))
+        return _ok_chat()
+
+    monkeypatch.setattr(classifier_mod.urllib.request, "urlopen", fake_urlopen)
+    long_ocr = "HEAD " + ("lorem " * 200) + " TAIL_MARKER"
+    settings = ClassifierSettings(provider="ollama", ollama_ocr_char_cap=40)
+    result = classify(long_ocr, "long.pdf", taxonomy, settings, local_ocr_text=long_ocr)
+    assert result["provider"] == "ollama"
+    prompt = captured[0]["messages"][0]["content"]
+    assert "HEAD" in prompt
+    assert "TAIL_MARKER" not in prompt
+    assert cap_ollama_ocr_text(long_ocr, limit=40) in prompt
 
 
 def test_ollama_ocr_capped_at_about_2500_tokens(monkeypatch, taxonomy):
@@ -434,7 +501,60 @@ def test_env_example_uses_lan_placeholder():
     )
     assert "# OLLAMA_URL=http://192.168.x.x:11434" in text
     assert "# OLLAMA_MODEL=qwen2.5:7b-instruct" in text
+    assert "# OLLAMA_OCR_CHAR_CAP=10000" in text
     assert "llama3.2" not in text
+
+
+def test_ollama_short_name_and_doc_date_are_used_in_filename(
+    tmp_scan_tree, runconfig_factory, monkeypatch,
+):
+    monkeypatch.setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+    _write(tmp_scan_tree["src"] / "bill.pdf", CLEAN_BILL)
+
+    def fake_extract(path: Path, max_pages: int = 5, dpi: int = 300) -> str:
+        return CLEAN_BILL
+
+    def fake_urlopen(req, timeout=None):
+        return _ok_chat(json.dumps({
+            "category": "Household/Home/Utilities",
+            "confidence": 0.91,
+            "reason": "electric bill",
+            "short_name": "Electric Bill!!",
+            "doc_date": "2026-09-01",
+        }))
+
+    monkeypatch.setattr(ocr_mod, "extract_text", fake_extract)
+    monkeypatch.setattr(classifier_mod.urllib.request, "urlopen", fake_urlopen)
+    cfg = runconfig_factory(provider="ollama")
+    result = process_batch(cfg)
+    outcome = result.outcomes[0]
+    assert outcome.action == "move"
+    assert outcome.dest is not None
+    assert outcome.dest.name == "electric_bill_2026-09-01.pdf"
+    assert outcome.classification.get("short_name") == "Electric Bill!!"
+    assert outcome.classification.get("doc_date") == "2026-09-01"
+
+
+def test_ollama_accepts_constrained_category_json(monkeypatch, taxonomy):
+    monkeypatch.setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+    captured = []
+
+    def fake_urlopen(req, timeout=None):
+        captured.append(json.loads(req.data.decode("utf-8")))
+        return _ok_chat(json.dumps({
+            "category": "Household/Home/Utilities",
+            "confidence": 0.91,
+            "reason": "electric bill",
+        }))
+
+    monkeypatch.setattr(classifier_mod.urllib.request, "urlopen", fake_urlopen)
+    settings = ClassifierSettings(provider="ollama")
+    result = classify(CLEAN_BILL, "bill.pdf", taxonomy, settings)
+    assert result["provider"] == "ollama"
+    assert result["category"] == "Household/Home/Utilities"
+    assert result["reason"] == "electric bill"
+    assert result["confidence"] == 0.91
+    _assert_constrained_ollama_body(captured[0], taxonomy)
 
 
 def test_low_confidence_ollama_answer_goes_to_review(

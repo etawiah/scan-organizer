@@ -19,7 +19,12 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 from . import __version__
-from .classifier import ClassifierSettings, CloudCallBudget, provider_probe
+from .classifier import (
+    OLLAMA_OCR_CHAR_CAP,
+    ClassifierSettings,
+    CloudCallBudget,
+    provider_probe,
+)
 from .config import (
     DEFAULT_CONFIDENCE_THRESHOLD,
     DEFAULT_LOG_DIRNAME,
@@ -75,6 +80,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help=f"Override the YAML's confidence_threshold (default: taxonomy value or {DEFAULT_CONFIDENCE_THRESHOLD}).")
     p.add_argument("--ocr-pages", type=int, default=DEFAULT_OCR_PAGES,
                    help=f"PDF pages to OCR (default: {DEFAULT_OCR_PAGES}).")
+    p.add_argument(
+        "--ollama-ocr-chars",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Max OCR characters sent to Ollama "
+            f"(default: $OLLAMA_OCR_CHAR_CAP or {OLLAMA_OCR_CHAR_CAP})."
+        ),
+    )
 
     p.add_argument("--dry-run", action="store_true",
                    help="Write the manifest and print the plan without moving anything.")
@@ -162,6 +177,7 @@ def _build_runconfig(args: argparse.Namespace) -> RunConfig:
         model=args.model,
         no_retry=bool(getattr(args, "no_retry", False)),
         cloud_budget=_cloud_budget_from_args(args),
+        ollama_ocr_char_cap=getattr(args, "ollama_ocr_chars", None),
     )
 
     stamp = utc_run_stamp()

@@ -26,6 +26,7 @@ from .privacy import (
     assert_safe_for_outbound,
     gate,
 )
+from .secureio import chmod_owner_only
 from .vocabulary import extract_outbound_signals
 from .scanner import CandidateFile, walk_inbox
 from .taxonomy import Taxonomy, TaxonomyNode
@@ -104,6 +105,7 @@ class PromptDumpWriter:
             pass
         self._fh = os.fdopen(self._fd, "w", encoding="utf-8")
         self._fd = None
+        chmod_owner_only(self.path)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -186,7 +188,11 @@ def _classify_file(
         if local_ollama:
             # Local model sees the full OCR; do not run the outbound
             # token allowlist (that gate is for cloud only).
-            prompt = classifier_mod._build_local_prompt(taxonomy, text)
+            prompt = classifier_mod._build_local_prompt(
+                taxonomy,
+                text,
+                char_cap=classifier_mod.resolve_ollama_ocr_char_cap(settings),
+            )
         else:
             signals = extract_outbound_signals(text)
             prompt = classifier_mod._build_prompt(taxonomy, signals)
@@ -222,15 +228,32 @@ def _resolve_node(
 ) -> Optional[TaxonomyNode]:
     """Normalize the model path and match it case-insensitively.
 
-    Invalid, empty, or unrecognised paths return ``None`` so the caller
-    routes the file to ``_Review/`` and never files it.
+    Exact leaf matches keep the model's confidence. A valid leaf followed
+    by extra trailing segments (a document-type suffix) snaps to that
+    leaf and is marked ``snapped`` so the caller always routes the file
+    to ``_Review/``, regardless of the confidence threshold. Invalid,
+    empty, or unrecognised paths return ``None`` so the caller also
+    routes them to ``_Review/``. This never snaps across top-level
+    owners or between sibling businesses.
     """
-    node = taxonomy.match_classification(classification)
-    if node is None:
+    hit = taxonomy.match_or_snap_classification(classification)
+    if hit is None:
         return None
+    node = hit.node
     classification["owner"] = node.owner
     classification["area"] = node.area
     classification["doc_type"] = node.doc_type
+    classification["category"] = node.as_canonical_path()
+    if hit.snapped:
+        classification["snapped"] = True
+        classification["snapped_from"] = hit.original
+        try:
+            original_conf = float(classification.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            original_conf = 0.0
+        classification["model_confidence"] = original_conf
+    else:
+        classification["snapped"] = False
     return node
 
 
@@ -357,9 +380,9 @@ def _process_file(
         return FileOutcome(src=file_path, dest=dest, action="review",
                            reason=f"classifier crash: {exc}")
 
-    confidence = float(classification.get("confidence", 0.0) or 0.0)
     provider = str(classification.get("provider") or cfg.settings.provider)
     node = _resolve_node(classification, cfg.taxonomy)
+    confidence = float(classification.get("confidence", 0.0) or 0.0)
 
     if classification.get("ollama_error"):
         dest = _route_to_fallback(file_path, cfg.review_dir, file_path.name, cfg.dry_run)
@@ -383,9 +406,10 @@ def _process_file(
         return FileOutcome(src=file_path, dest=dest, action="review",
                            reason=reason, classification=classification, provider=provider)
 
-    if node is None or confidence < cfg.taxonomy.confidence_threshold:
+    if node is None or classification.get("snapped") or confidence < cfg.taxonomy.confidence_threshold:
         reason = (
             "invalid taxonomy node" if node is None
+            else "snapped category suffix" if classification.get("snapped")
             else f"confidence {confidence:.2f} < threshold {cfg.taxonomy.confidence_threshold:.2f}"
         )
         dest = _route_to_fallback(file_path, cfg.review_dir, file_path.name, cfg.dry_run)
