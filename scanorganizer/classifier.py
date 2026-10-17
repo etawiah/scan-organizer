@@ -36,7 +36,7 @@ from urllib.parse import urlparse
 
 from . import local_rules
 from .privacy import SensitiveTerms, assert_safe_for_outbound
-from .taxonomy import DEFAULT_DOC_TYPE_ALIASES, Taxonomy, alias_doc_type
+from .taxonomy import DEFAULT_DOC_TYPE_ALIASES, Taxonomy, alias_doc_type, join_category_path
 from .vocabulary import OutboundSignals, extract_outbound_signals
 
 log = logging.getLogger(__name__)
@@ -58,6 +58,7 @@ MIN_OLLAMA_TIMEOUT_S = 120
 # ~2500 tokens ≈ 4 chars/token. Head of the page is kept (letterhead / title).
 OLLAMA_OCR_TOKEN_CAP = 2500
 OLLAMA_OCR_CHAR_CAP = 10_000
+DEFAULT_OLLAMA_TEMPERATURE = 0.0
 
 _OLLAMA_LOCK = threading.Lock()
 
@@ -219,26 +220,69 @@ def cap_ollama_ocr_text(text: str, limit: int = OLLAMA_OCR_CHAR_CAP) -> str:
     return body[:limit]
 
 
-def _build_local_prompt(taxonomy: Taxonomy, ocr_text: str) -> str:
+def resolve_ollama_ocr_char_cap(settings: Optional["ClassifierSettings"] = None) -> int:
+    """OCR character cap for local Ollama prompts. Default remains 10_000."""
+    if settings is not None and settings.ollama_ocr_char_cap is not None:
+        return max(0, int(settings.ollama_ocr_char_cap))
+    raw = os.environ.get("OLLAMA_OCR_CHAR_CAP")
+    if raw is None or str(raw).strip() == "":
+        raw = os.environ.get("SCAN_OLLAMA_OCR_CHAR_CAP")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(0, int(str(raw).strip()))
+        except ValueError:
+            return OLLAMA_OCR_CHAR_CAP
+    return OLLAMA_OCR_CHAR_CAP
+
+
+def ollama_response_format(taxonomy: Taxonomy) -> Dict[str, object]:
+    """Ollama ``format`` JSON schema: category is an enum of exact leaf paths."""
+    leaves = taxonomy.leaf_paths()
+    if not leaves:
+        raise ProviderError("taxonomy has no leaf category paths")
+    return {
+        "type": "object",
+        "properties": {
+            "category": {
+                "type": "string",
+                "enum": leaves,
+            },
+            "confidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+            },
+            "reason": {
+                "type": "string",
+            },
+        },
+        "required": ["category", "confidence", "reason"],
+        "additionalProperties": False,
+    }
+
+
+def _build_local_prompt(
+    taxonomy: Taxonomy,
+    ocr_text: str,
+    char_cap: Optional[int] = None,
+) -> str:
     """Full-text prompt for a local model. OCR never leaves the house."""
     allowed = taxonomy.describe_for_prompt()
-    body = cap_ollama_ocr_text(ocr_text if ocr_text is not None else "")
+    limit = OLLAMA_OCR_CHAR_CAP if char_cap is None else max(0, int(char_cap))
+    body = cap_ollama_ocr_text(ocr_text if ocr_text is not None else "", limit=limit)
     return f"""You are classifying scanned household business documents into a strict taxonomy.
 
-ALLOWED taxonomy nodes owner area doc_type. You must pick EXACTLY one.
-Use empty string for area when the node has no area segment.
+ALLOWED category paths. You must pick EXACTLY one path from the list.
+Copy the path exactly. Do not add a document type after it. Never insert an empty segment.
 
 {allowed}
 
 Return ONLY a JSON object with these keys nothing else
-  owner string must be one of the owners above
-  area string empty if the owner has no area segment
-  doc_type string must match the owner area pair
-  doc_date string empty if unknown
-  confidence float reflecting how sure you are about owner area doc_type
-  short_name short descriptive name lowercase words underscores no file extension no PII
+  category string must be exactly one of the allowed paths above
+  confidence float reflecting how sure you are about the category
+  reason short explanation with no PII
 
-If you cannot confidently place the document in any node set confidence low
+If you cannot confidently place the document in any path set confidence low
 rather than guessing the caller will route low confidence documents for human review.
 
 The document text below has already had private terms redacted. Classify it.
@@ -342,6 +386,7 @@ class ClassifierSettings:
     cloud_budget: Optional[CloudCallBudget] = None
     ollama_url: Optional[str] = None
     ollama_timeout_s: Optional[int] = None
+    ollama_ocr_char_cap: Optional[int] = None
 
 
 def _resolve_anthropic_model(settings: ClassifierSettings) -> str:
@@ -427,25 +472,41 @@ def _ollama_post(url: str, body: Dict[str, object], timeout: int) -> Dict[str, o
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _call_ollama(prompt: str, settings: ClassifierSettings) -> str:
+def _call_ollama(
+    prompt: str,
+    settings: ClassifierSettings,
+    taxonomy: Optional[Taxonomy] = None,
+) -> str:
     """Call a LAN Ollama daemon. Tries ``/api/chat`` then ``/api/generate``.
 
     The host model handles one request at a time, so every call takes a
     process-wide lock and the batch loop never overlaps requests.
     """
     with _OLLAMA_LOCK:
-        return _call_ollama_locked(prompt, settings)
+        return _call_ollama_locked(prompt, settings, taxonomy)
 
 
-def _call_ollama_locked(prompt: str, settings: ClassifierSettings) -> str:
+def _ollama_request_format(taxonomy: Optional[Taxonomy]) -> object:
+    if taxonomy is None:
+        return "json"
+    return ollama_response_format(taxonomy)
+
+
+def _call_ollama_locked(
+    prompt: str,
+    settings: ClassifierSettings,
+    taxonomy: Optional[Taxonomy] = None,
+) -> str:
     base = resolve_ollama_url(settings.ollama_url)
     model = _resolve_ollama_model(settings)
     timeout = _resolve_ollama_timeout(settings)
+    request_format = _ollama_request_format(taxonomy)
     chat_body = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
-        "format": "json",
+        "format": request_format,
+        "options": {"temperature": DEFAULT_OLLAMA_TEMPERATURE},
     }
     try:
         result = _ollama_post(f"{base}/api/chat", chat_body, timeout)
@@ -466,7 +527,8 @@ def _call_ollama_locked(prompt: str, settings: ClassifierSettings) -> str:
         "model": model,
         "prompt": prompt,
         "stream": False,
-        "format": "json",
+        "format": request_format,
+        "options": {"temperature": DEFAULT_OLLAMA_TEMPERATURE},
     }
     try:
         result = _ollama_post(f"{base}/api/generate", generate_body, timeout)
@@ -700,8 +762,9 @@ def classify(
             prompt = _build_local_prompt(
                 taxonomy,
                 local_ocr_text if local_ocr_text is not None else text,
+                char_cap=resolve_ollama_ocr_char_cap(settings),
             )
-            raw = _call_ollama(prompt, settings)
+            raw = _call_ollama(prompt, settings, taxonomy)
             parsed = _coerce(_extract_json(raw))
             parsed["provider"] = "ollama"
             parsed["is_local"] = True
@@ -760,10 +823,15 @@ def _coerce(raw: Dict[str, object]) -> Dict[str, object]:
         str(raw.get("doc_type", "") or "").strip(),
         DEFAULT_DOC_TYPE_ALIASES,
     )
+    category = str(raw.get("category") or raw.get("path") or raw.get("node") or "").strip()
+    if not category and (out["owner"] or out["area"] or out["doc_type"]):
+        category = join_category_path(out["owner"], out["area"], out["doc_type"])
+    out["category"] = category
     out["doc_date"] = str(raw.get("doc_date", "") or "").strip()
     try:
         out["confidence"] = float(raw.get("confidence", 0.0) or 0.0)
     except (TypeError, ValueError):
         out["confidence"] = 0.0
     out["short_name"] = str(raw.get("short_name", "") or "").strip()
+    out["reason"] = str(raw.get("reason", "") or "").strip()
     return out

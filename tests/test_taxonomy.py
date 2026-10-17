@@ -8,7 +8,12 @@ import pytest
 from scanorganizer import classifier as classifier_mod
 from scanorganizer import ocr as ocr_mod
 from scanorganizer.organizer import _resolve_node, process_batch
-from scanorganizer.taxonomy import Taxonomy, TaxonomyError, normalize_path_segments
+from scanorganizer.taxonomy import (
+    Taxonomy,
+    TaxonomyError,
+    join_category_path,
+    normalize_path_segments,
+)
 from tests.test_outbound_privacy import _write
 
 
@@ -77,6 +82,34 @@ def test_tax_in_mapping_is_merged_to_taxes():
     })
     assert tax.tree["Business"]["X"] == ["Taxes"]
     assert tax.node("Business", "X", "Tax").doc_type == "Taxes"
+
+
+def test_join_category_path_skips_empty_area_segment():
+    assert join_category_path("Personal", "", "Medical") == "Personal/Medical"
+    assert join_category_path("Personal", None, "Medical") == "Personal/Medical"
+    assert join_category_path("Business", "ComplexTech", "Taxes") == (
+        "Business/ComplexTech/Taxes"
+    )
+    assert join_category_path("Personal", "  ", "Medical") == "Personal/Medical"
+    assert "//" not in join_category_path("Personal", "", "Medical")
+
+
+def test_canonical_leaf_paths_have_no_empty_segments(taxonomy):
+    leaves = taxonomy.leaf_paths()
+    assert "Personal/Medical" in leaves
+    assert "Personal/Taxes" in leaves
+    assert "Business/ComplexTech/Taxes" in leaves
+    assert "Household/Vehicles/Registration" in leaves
+    assert "Personal//Medical" not in leaves
+    listing = taxonomy.describe_for_prompt()
+    assert "//" not in listing
+    assert "- Personal/Medical" in listing
+    assert "- Business/ComplexTech/Taxes" in listing
+    for node in taxonomy.iter_nodes():
+        path = node.as_canonical_path()
+        assert path
+        assert "//" not in path
+        assert path == node.as_relpath().as_posix()
 
 
 def test_normalize_path_collapses_blanks_and_repeats():
@@ -176,3 +209,111 @@ def test_case_insensitive_valid_path_is_filed(
     assert outcome.action == "move"
     assert outcome.dest is not None
     assert outcome.dest.relative_to(cfg.dest).parts[:3] == ("Household", "Home", "Utilities")
+
+
+def test_personal_double_slash_is_exact_canonical_not_snapped(taxonomy):
+    hit = taxonomy.match_or_snap_path("Personal//Medical")
+    assert hit is not None
+    assert hit.snapped is False
+    assert hit.node.as_canonical_path() == "Personal/Medical"
+    node = _resolve_node(
+        {"category": "Personal//Medical", "confidence": 0.99},
+        taxonomy,
+    )
+    assert node is not None
+    assert node.as_canonical_path() == "Personal/Medical"
+
+
+def test_snap_doc_type_suffix_to_longest_leaf(taxonomy):
+    hit = taxonomy.match_or_snap_path("Business/ComplexTech/Taxes//W-2")
+    assert hit is not None
+    assert hit.snapped is True
+    assert hit.node.as_canonical_path() == "Business/ComplexTech/Taxes"
+    assert hit.original == "Business/ComplexTech/Taxes//W-2"
+
+    hit = taxonomy.match_or_snap_path("Business/ComplexTech/Taxes/W-2")
+    assert hit is not None and hit.snapped
+    assert hit.node.as_canonical_path() == "Business/ComplexTech/Taxes"
+
+    classification = {
+        "category": "  business / complextech / taxes // w-2 ",
+        "confidence": 0.99,
+    }
+    node = _resolve_node(classification, taxonomy)
+    assert node is not None
+    assert node.as_canonical_path() == "Business/ComplexTech/Taxes"
+    assert classification["snapped"] is True
+    assert classification["confidence"] == 0.0
+    assert classification["category"] == "Business/ComplexTech/Taxes"
+
+
+def test_snap_does_not_cross_owners_or_sibling_businesses(taxonomy):
+    assert taxonomy.match_or_snap_path("Business//Bills-In") is None
+    assert taxonomy.match_or_snap_path("Business/432SouthStVT/Vehicles//OrderForm") is None
+    assert taxonomy.match_or_snap_path("Business/432SouthStVT/Vehicles/OrderForm") is None
+    # Must not become Household/Vehicles or another business.
+    assert taxonomy.match_or_snap_path("Personal/ComplexTech/Taxes") is None
+    assert taxonomy.match_or_snap_path("Campaign/ComplexTech/Taxes") is None
+    assert _resolve_node(
+        {"category": "Business/432SouthStVT/Vehicles//OrderForm", "confidence": 0.99},
+        taxonomy,
+    ) is None
+
+
+def test_snapped_suffix_goes_to_review_and_is_marked(
+    tmp_scan_tree, runconfig_factory, monkeypatch,
+):
+    _write(tmp_scan_tree["src"] / "w2.pdf", "City Electric Co monthly electric bill. kWh 40.")
+
+    def fake_extract(path: Path, max_pages: int = 5, dpi: int = 300) -> str:
+        return "City Electric Co monthly electric bill. kWh 40."
+
+    def fake_classify(*_a, **_k):
+        return {
+            "category": "Business/ComplexTech/Taxes//W-2",
+            "confidence": 0.99,
+            "reason": "form looks like a w2",
+            "provider": "ollama",
+            "is_local": True,
+        }
+
+    monkeypatch.setattr(ocr_mod, "extract_text", fake_extract)
+    monkeypatch.setattr(classifier_mod, "classify", fake_classify)
+    cfg = runconfig_factory(provider="ollama")
+    result = process_batch(cfg)
+    outcome = result.outcomes[0]
+    assert outcome.action == "review"
+    assert cfg.review_dir in outcome.dest.parents
+    assert outcome.classification.get("snapped") is True
+    assert outcome.classification.get("snapped_from") == "Business/ComplexTech/Taxes//W-2"
+    assert outcome.classification.get("category") == "Business/ComplexTech/Taxes"
+    assert outcome.classification.get("confidence") == 0.0
+
+
+def test_personal_double_slash_category_files_when_confident(
+    tmp_scan_tree, runconfig_factory, monkeypatch,
+):
+    _write(tmp_scan_tree["src"] / "letter.pdf", "City Electric Co monthly electric bill. kWh 40.")
+
+    def fake_extract(path: Path, max_pages: int = 5, dpi: int = 300) -> str:
+        return "City Electric Co monthly electric bill. kWh 40."
+
+    def fake_classify(*_a, **_k):
+        return {
+            "category": "Household//Home//Utilities",
+            "confidence": 0.99,
+            "reason": "electric bill",
+            "provider": "ollama",
+            "is_local": True,
+        }
+
+    monkeypatch.setattr(ocr_mod, "extract_text", fake_extract)
+    monkeypatch.setattr(classifier_mod, "classify", fake_classify)
+    cfg = runconfig_factory(provider="ollama")
+    result = process_batch(cfg)
+    outcome = result.outcomes[0]
+    assert outcome.action == "move"
+    assert outcome.dest is not None
+    assert outcome.dest.relative_to(cfg.dest).parts[:3] == ("Household", "Home", "Utilities")
+    assert outcome.classification.get("snapped") is False
+    assert outcome.classification.get("category") == "Household/Home/Utilities"

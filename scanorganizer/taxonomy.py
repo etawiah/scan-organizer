@@ -70,6 +70,16 @@ def normalize_path_segments(path: str | Sequence[str] | None) -> Tuple[str, ...]
     return tuple(collapsed)
 
 
+def join_category_path(*segments: object) -> str:
+    """Join taxonomy segments into a canonical path with no empty ``//``.
+
+    Owners that have no subgroup (YAML area key ``""``) must be
+    ``Personal/Medical``, never ``Personal//Medical``. Blank segments,
+    surrounding whitespace, and consecutive slashes are dropped.
+    """
+    return "/".join(normalize_path_segments(tuple("" if s is None else str(s) for s in segments)))
+
+
 def alias_doc_type(
     doc_type: str,
     aliases: Optional[Mapping[str, str]] = None,
@@ -98,8 +108,21 @@ class TaxonomyNode:
             return (self.owner, self.area, self.doc_type)
         return (self.owner, self.doc_type)
 
+    def as_canonical_path(self) -> str:
+        """Leaf path used in prompts, validation, folders, and the manifest."""
+        return join_category_path(*self.parts)
+
     def as_relpath(self) -> Path:
         return Path(*self.parts)
+
+
+@dataclass(frozen=True)
+class PathMatch:
+    """A taxonomy leaf resolved from a model path, with optional suffix snap."""
+
+    node: TaxonomyNode
+    snapped: bool = False
+    original: str = ""
 
 
 @dataclass
@@ -234,23 +257,77 @@ class Taxonomy:
         return None
 
     def match_classification(self, classification: Mapping[str, object]) -> Optional[TaxonomyNode]:
-        """Resolve a model payload to a taxonomy node, or None if invalid."""
+        """Resolve a model payload to a taxonomy node, or None if invalid.
+
+        Exact leaf only. Trailing doc-type suffixes are handled by
+        :meth:`match_or_snap_classification`.
+        """
+        for raw in self._classification_raw_paths(classification):
+            node = self.match_path(raw)
+            if node is not None:
+                return node
+        return None
+
+    def _classification_raw_paths(
+        self,
+        classification: Mapping[str, object],
+    ) -> List[str]:
+        """Candidate path strings from a model payload, in priority order."""
+        raws: List[str] = []
         for key in ("category", "path", "node"):
             raw = classification.get(key)
             if raw:
-                node = self.match_path(str(raw))
-                if node is not None:
-                    return node
+                raws.append(str(raw))
         owner = str(classification.get("owner") or "")
         area = classification.get("area")
         doc_type = str(classification.get("doc_type") or "")
-        joined = normalize_path_segments((owner, "" if area is None else str(area), doc_type))
-        node = self.match_path(joined)
-        if node is not None:
-            return node
+        joined = join_category_path(owner, "" if area is None else str(area), doc_type)
+        if joined:
+            raws.append(joined)
         # Last chance: treat owner itself as a full path (e.g. ``A//A/B``).
         if owner and not str(area or "").strip() and not doc_type:
-            return self.match_path(owner)
+            raws.append(owner)
+        return raws
+
+    def match_or_snap_path(self, path: str | Sequence[str] | None) -> Optional[PathMatch]:
+        """Exact leaf match after normalize, or snap a trailing doc-type suffix.
+
+        Normalization trims whitespace, is case-insensitive, and collapses
+        ``//``. Extra segments after a valid leaf (``Taxes//W-2``,
+        ``Taxes/W-2``) snap to that leaf. Prefixes that are not themselves
+        leaves are never used, so this will not jump from
+        ``Business/432SouthStVT/Vehicles`` to ``Household/Vehicles`` or
+        across top-level owners. Anything else is invalid.
+        """
+        if isinstance(path, str):
+            original = path
+        elif path is None:
+            original = ""
+        else:
+            original = join_category_path(*path)
+        parts = normalize_path_segments(path)
+        if not parts:
+            return None
+        exact = self.match_path(parts)
+        if exact is not None:
+            return PathMatch(node=exact, snapped=False, original=original)
+        # Longest prefix that is a leaf. Only drop trailing segments;
+        # never rewrite owner or area to a sibling business.
+        for end in range(len(parts) - 1, 0, -1):
+            node = self.match_path(parts[:end])
+            if node is not None:
+                return PathMatch(node=node, snapped=True, original=original)
+        return None
+
+    def match_or_snap_classification(
+        self,
+        classification: Mapping[str, object],
+    ) -> Optional[PathMatch]:
+        """Resolve a model payload, snapping a trailing doc-type suffix if needed."""
+        for raw in self._classification_raw_paths(classification):
+            hit = self.match_or_snap_path(raw)
+            if hit is not None:
+                return hit
         return None
 
     def node(self, owner: str, area: Optional[str], doc_type: str) -> TaxonomyNode:
@@ -269,12 +346,10 @@ class Taxonomy:
     def owners(self) -> List[str]:
         return list(self.tree.keys())
 
+    def leaf_paths(self) -> List[str]:
+        """Canonical leaf category paths (no empty segments)."""
+        return [node.as_canonical_path() for node in self.iter_nodes()]
+
     def describe_for_prompt(self) -> str:
-        """Human-readable listing of valid (owner, area, doc_type) tuples."""
-        lines = []
-        for owner, areas in self.tree.items():
-            for area, doc_types in areas.items():
-                prefix = f"{owner}/" if not area else f"{owner}/{area}/"
-                for dt in doc_types:
-                    lines.append(f"- {prefix}{dt}")
-        return "\n".join(lines)
+        """Human-readable listing of valid leaf category paths."""
+        return "\n".join(f"- {path}" for path in self.leaf_paths())

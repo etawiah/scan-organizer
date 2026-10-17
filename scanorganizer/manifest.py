@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional
 
 from .hashing import sha256_file
+from .secureio import chmod_owner_only
 
 MANIFEST_VERSION = 1
 
@@ -73,6 +74,7 @@ class ManifestWriter:
 
     def __enter__(self) -> "ManifestWriter":
         self._fh = open(self.path, "a", encoding="utf-8")
+        chmod_owner_only(self.path)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:

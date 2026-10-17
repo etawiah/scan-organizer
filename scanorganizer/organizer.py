@@ -186,7 +186,11 @@ def _classify_file(
         if local_ollama:
             # Local model sees the full OCR; do not run the outbound
             # token allowlist (that gate is for cloud only).
-            prompt = classifier_mod._build_local_prompt(taxonomy, text)
+            prompt = classifier_mod._build_local_prompt(
+                taxonomy,
+                text,
+                char_cap=classifier_mod.resolve_ollama_ocr_char_cap(settings),
+            )
         else:
             signals = extract_outbound_signals(text)
             prompt = classifier_mod._build_prompt(taxonomy, signals)
@@ -222,15 +226,34 @@ def _resolve_node(
 ) -> Optional[TaxonomyNode]:
     """Normalize the model path and match it case-insensitively.
 
+    Exact leaf matches keep the model's confidence. A valid leaf followed
+    by extra trailing segments (a document-type suffix) snaps to that
+    leaf, is marked ``snapped`` in the classification, and is treated as
+    low confidence so it goes to ``_Review/`` unless the threshold is 0.
     Invalid, empty, or unrecognised paths return ``None`` so the caller
-    routes the file to ``_Review/`` and never files it.
+    routes the file to ``_Review/`` and never files it. This never snaps
+    across top-level owners or between sibling businesses.
     """
-    node = taxonomy.match_classification(classification)
-    if node is None:
+    hit = taxonomy.match_or_snap_classification(classification)
+    if hit is None:
         return None
+    node = hit.node
     classification["owner"] = node.owner
     classification["area"] = node.area
     classification["doc_type"] = node.doc_type
+    classification["category"] = node.as_canonical_path()
+    if hit.snapped:
+        classification["snapped"] = True
+        classification["snapped_from"] = hit.original
+        try:
+            original_conf = float(classification.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            original_conf = 0.0
+        classification["model_confidence"] = original_conf
+        # Snapped suffixes are not exact matches: force low confidence.
+        classification["confidence"] = 0.0
+    else:
+        classification["snapped"] = False
     return node
 
 
@@ -357,9 +380,9 @@ def _process_file(
         return FileOutcome(src=file_path, dest=dest, action="review",
                            reason=f"classifier crash: {exc}")
 
-    confidence = float(classification.get("confidence", 0.0) or 0.0)
     provider = str(classification.get("provider") or cfg.settings.provider)
     node = _resolve_node(classification, cfg.taxonomy)
+    confidence = float(classification.get("confidence", 0.0) or 0.0)
 
     if classification.get("ollama_error"):
         dest = _route_to_fallback(file_path, cfg.review_dir, file_path.name, cfg.dry_run)

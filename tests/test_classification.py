@@ -83,6 +83,31 @@ def test_coerce_maps_tax_alias_to_taxes():
         "short_name": "corp_return",
     })
     assert out["doc_type"] == "Taxes"
+    assert out["category"] == "Business/ComplexTech/Taxes"
+    assert "//" not in out["category"]
+
+
+def test_coerce_category_path_skips_empty_area():
+    out = _coerce({
+        "owner": "Personal",
+        "area": "",
+        "doc_type": "Medical",
+        "confidence": 0.9,
+        "reason": "clinic note",
+    })
+    assert out["category"] == "Personal/Medical"
+    assert out["reason"] == "clinic note"
+
+
+def test_coerce_reads_constrained_category_payload():
+    out = _coerce({
+        "category": "Household/Home/Utilities",
+        "confidence": 0.91,
+        "reason": "electric bill",
+    })
+    assert out["category"] == "Household/Home/Utilities"
+    assert out["confidence"] == 0.91
+    assert out["reason"] == "electric bill"
 
 
 def test_classifier_falls_back_when_remote_missing(taxonomy, monkeypatch):
